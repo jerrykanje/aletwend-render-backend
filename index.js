@@ -7,9 +7,11 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Firebase init
+// 🔥 Firebase init using ENV variable
+const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
+
 admin.initializeApp({
-  credential: admin.credential.cert(require("./serviceAccountKey.json"))
+  credential: admin.credential.cert(serviceAccount)
 });
 
 const db = admin.firestore();
@@ -22,7 +24,7 @@ db.settings({
 // helper
 const val = (x) => x ?? "";
 
-// 🔥 TEST FIRESTORE ROUTE (NEW)
+// 🔥 TEST FIRESTORE ROUTE
 app.get("/testfirestore", async (req, res) => {
   try {
     await db.collection("test").doc("ping").set({
@@ -154,6 +156,7 @@ app.post("/classifyVehicleAndSaveDriver", async (req, res) => {
     });
 
   } catch (error) {
+    console.error(error);
     return res.status(500).json({
       error: error.message
     });
@@ -165,7 +168,7 @@ app.get("/", (req, res) => {
   res.send("Backend running 🚀");
 });
 
-// START SERVER (improved)
+// START SERVER
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
