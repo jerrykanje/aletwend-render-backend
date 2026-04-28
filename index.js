@@ -283,7 +283,7 @@ app.post("/getRideOptions", async (req, res) => {
       );
 
       // only nearby drivers 7km
-      if (distance > 7) return;
+      if (distance > 5000) return;
 
       drivers.push({
         uid,
