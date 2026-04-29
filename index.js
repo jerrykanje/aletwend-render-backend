@@ -1,4 +1,4 @@
-const express = require("express");
+ const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 
@@ -7,18 +7,19 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 🔥 Firebase init using ENV variable
+/* =======================================================
+   🔥 FIREBASE INIT
+======================================================= */
 const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
-  databaseURL: process.env.RTDB_URL // ADD THIS in Render env vars
+  databaseURL: process.env.RTDB_URL
 });
 
 const db = admin.firestore();
 const rtdb = admin.database();
 
-// IMPORTANT
 db.settings({
   ignoreUndefinedProperties: true
 });
@@ -27,7 +28,7 @@ db.settings({
 const val = (x) => x ?? "";
 
 /* =======================================================
-   🔥 TEST FIRESTORE ROUTE (UNCHANGED)
+   🔥 TEST FIRESTORE ROUTE
 ======================================================= */
 app.get("/testfirestore", async (req, res) => {
   try {
@@ -43,7 +44,7 @@ app.get("/testfirestore", async (req, res) => {
 });
 
 /* =======================================================
-   🚗 MAIN ROUTE (UNCHANGED)
+   🚗 SAVE DRIVER VEHICLE
 ======================================================= */
 app.post("/classifyVehicleAndSaveDriver", async (req, res) => {
   try {
@@ -147,6 +148,7 @@ app.post("/classifyVehicleAndSaveDriver", async (req, res) => {
 
     await db.collection("drivers").doc(uid).set(
       {
+        uid, // 🔥 FIX: ensure uid exists in firestore doc
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         registrationStep: 6,
         vehicle
@@ -170,7 +172,7 @@ app.post("/classifyVehicleAndSaveDriver", async (req, res) => {
 });
 
 /* =======================================================
-   🔥 HELPERS FOR CLIENT APP
+   HELPERS
 ======================================================= */
 
 // distance in KM
@@ -189,15 +191,13 @@ function haversine(lat1, lon1, lat2, lon2) {
 
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 
-  return R * c;
+  return R * c; // km
 }
 
-// simple price calculator
 function calculateFare(baseFare, km) {
   return Math.round(baseFare + (km * 6));
 }
 
-// category titles
 function titleCase(cat) {
   const map = {
     economy: "Economy",
@@ -212,9 +212,8 @@ function titleCase(cat) {
 }
 
 /* =======================================================
-   🚕 NEW ROUTE FOR CLIENT APP
+   🚕 GET RIDE OPTIONS (FIXED)
 ======================================================= */
-
 app.post("/getRideOptions", async (req, res) => {
   try {
     const body = req.body || {};
@@ -224,7 +223,13 @@ app.post("/getRideOptions", async (req, res) => {
     const dropLat = Number(body.dropLat);
     const dropLng = Number(body.dropLng);
 
-    if (!pickupLat || !pickupLng || !dropLat || !dropLng) {
+    // 🔥 FIX: proper zero-coordinate validation
+    if (
+      isNaN(pickupLat) ||
+      isNaN(pickupLng) ||
+      isNaN(dropLat) ||
+      isNaN(dropLng)
+    ) {
       return res.status(400).json({
         error: "Missing coordinates"
       });
@@ -237,7 +242,6 @@ app.post("/getRideOptions", async (req, res) => {
       dropLng
     );
 
-    // always show all cards
     const categories = [
       "economy",
       "comfort",
@@ -247,33 +251,35 @@ app.post("/getRideOptions", async (req, res) => {
       "aletwende"
     ];
 
-    // realtime db
     const onlineSnap = await rtdb.ref("drivers_online").once("value");
     const locationSnap = await rtdb.ref("driver_locations").once("value");
 
     const online = onlineSnap.val() || {};
     const locations = locationSnap.val() || {};
 
-    // firestore drivers
     const driversSnap = await db.collection("drivers").get();
 
     const drivers = [];
 
     driversSnap.forEach((doc) => {
-      const d = doc.data();
+      const d = doc.data() || {};
 
-      const uid = d.uid;
+      // 🔥 FIX: use document id if uid missing
+      const uid = d.uid || doc.id;
 
       if (!uid) return;
       if (!online[uid]) return;
       if (!online[uid].isOnline) return;
       if (online[uid].isBusy) return;
       if (!locations[uid]) return;
+      if (!locations[uid].l) return;
       if (!d.vehicle) return;
       if (!d.vehicle.vehicleCategory) return;
 
-      const lat = locations[uid].l[0];
-      const lng = locations[uid].l[1];
+      const lat = Number(locations[uid].l[0]);
+      const lng = Number(locations[uid].l[1]);
+
+      if (isNaN(lat) || isNaN(lng)) return;
 
       const distance = haversine(
         pickupLat,
@@ -282,12 +288,12 @@ app.post("/getRideOptions", async (req, res) => {
         lng
       );
 
-      // only nearby drivers 7km
-      if (distance > 5) return;
+      // 🔥 FIX: haversine returns KM, so use 7 km
+      if (distance > 7) return;
 
       drivers.push({
         uid,
-        rating: d.rating || 0,
+        rating: Number(d.rating || 0),
         distance,
         vehicle: d.vehicle
       });
@@ -296,8 +302,6 @@ app.post("/getRideOptions", async (req, res) => {
     const cards = [];
 
     for (const category of categories) {
-
-      // special mappings
       let matches = drivers.filter((x) => {
         if (category === "economy") {
           return x.vehicle.vehicleCategory === "economy";
@@ -326,7 +330,6 @@ app.post("/getRideOptions", async (req, res) => {
         return false;
       });
 
-      // best driver first
       matches.sort((a, b) => {
         if (a.distance !== b.distance) {
           return a.distance - b.distance;
@@ -345,7 +348,6 @@ app.post("/getRideOptions", async (req, res) => {
           seats: null,
           image: `${category}.png`
         });
-
         continue;
       }
 
@@ -362,6 +364,7 @@ app.post("/getRideOptions", async (req, res) => {
 
       if (pricingDoc.exists) {
         const pdata = pricingDoc.data() || {};
+
         baseFare =
           pdata.baseFare ||
           pdata.base ||
