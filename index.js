@@ -148,7 +148,7 @@ app.post("/classifyVehicleAndSaveDriver", async (req, res) => {
 
     await db.collection("drivers").doc(uid).set(
       {
-        uid, // 🔥 FIX: ensure uid exists in firestore doc
+        uid,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         registrationStep: 6,
         vehicle
@@ -191,7 +191,7 @@ function haversine(lat1, lon1, lat2, lon2) {
 
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 
-  return R * c; // km
+  return R * c;
 }
 
 function calculateFare(baseFare, km) {
@@ -212,7 +212,7 @@ function titleCase(cat) {
 }
 
 /* =======================================================
-   🚕 GET RIDE OPTIONS (FIXED)
+   🚕 GET RIDE OPTIONS (SERVICE-TYPE AWARE)
 ======================================================= */
 app.post("/getRideOptions", async (req, res) => {
   try {
@@ -223,7 +223,8 @@ app.post("/getRideOptions", async (req, res) => {
     const dropLat = Number(body.dropLat);
     const dropLng = Number(body.dropLng);
 
-    // 🔥 FIX: proper zero-coordinate validation
+    const serviceType = (body.serviceType || "ride").toLowerCase();
+
     if (
       isNaN(pickupLat) ||
       isNaN(pickupLng) ||
@@ -242,14 +243,15 @@ app.post("/getRideOptions", async (req, res) => {
       dropLng
     );
 
-    const categories = [
-      "economy",
-      "comfort",
-      "xl",
-      "premium",
-      "women",
-      "aletwende"
-    ];
+    const SERVICE_CATEGORY_MAP = {
+      ride: ["economy", "comfort", "xl", "premium", "women", "aletwende"],
+      courier: ["delivery_car", "delivery_motorbike", "delivery_bicycle"],
+      delivery: ["delivery_truck", "delivery_car", "delivery_motorbike", "delivery_bicycle"],
+      delivery_truck: ["delivery_truck"],
+      towing: ["towing"]
+    };
+
+    const categories = SERVICE_CATEGORY_MAP[serviceType] || [];
 
     const onlineSnap = await rtdb.ref("drivers_online").once("value");
     const locationSnap = await rtdb.ref("driver_locations").once("value");
@@ -263,8 +265,6 @@ app.post("/getRideOptions", async (req, res) => {
 
     driversSnap.forEach((doc) => {
       const d = doc.data() || {};
-
-      // 🔥 FIX: use document id if uid missing
       const uid = d.uid || doc.id;
 
       if (!uid) return;
@@ -276,19 +276,17 @@ app.post("/getRideOptions", async (req, res) => {
       if (!d.vehicle) return;
       if (!d.vehicle.vehicleCategory) return;
 
+      if (
+        !Array.isArray(d.vehicle.services) ||
+        !d.vehicle.services.includes(serviceType)
+      ) return;
+
       const lat = Number(locations[uid].l[0]);
       const lng = Number(locations[uid].l[1]);
 
       if (isNaN(lat) || isNaN(lng)) return;
 
-      const distance = haversine(
-        pickupLat,
-        pickupLng,
-        lat,
-        lng
-      );
-
-      // 🔥 FIX: haversine returns KM, so use 7 km
+      const distance = haversine(pickupLat, pickupLng, lat, lng);
       if (distance > 7) return;
 
       drivers.push({
@@ -302,39 +300,22 @@ app.post("/getRideOptions", async (req, res) => {
     const cards = [];
 
     for (const category of categories) {
+
       let matches = drivers.filter((x) => {
-        if (category === "economy") {
-          return x.vehicle.vehicleCategory === "economy";
+        if (serviceType === "ride") {
+          if (category === "economy") return x.vehicle.vehicleCategory === "economy";
+          if (category === "xl") return x.vehicle.vehicleCategory === "xl";
+          if (category === "comfort") return x.vehicle.pricingCategory === "ride_comfort";
+          if (category === "premium") return x.vehicle.pricingCategory === "ride_premium";
+          if (category === "women") return x.vehicle.pricingCategory === "ride_women";
+          if (category === "aletwende") return x.vehicle.pricingCategory === "ride_aletwende";
         }
 
-        if (category === "xl") {
-          return x.vehicle.vehicleCategory === "xl";
-        }
-
-        if (category === "comfort") {
-          return x.vehicle.pricingCategory === "ride_comfort";
-        }
-
-        if (category === "premium") {
-          return x.vehicle.pricingCategory === "ride_premium";
-        }
-
-        if (category === "women") {
-          return x.vehicle.pricingCategory === "ride_women";
-        }
-
-        if (category === "aletwende") {
-          return x.vehicle.pricingCategory === "ride_aletwende";
-        }
-
-        return false;
+        return x.vehicle.vehicleCategory === category;
       });
 
       matches.sort((a, b) => {
-        if (a.distance !== b.distance) {
-          return a.distance - b.distance;
-        }
-
+        if (a.distance !== b.distance) return a.distance - b.distance;
         return b.rating - a.rating;
       });
 
@@ -353,30 +334,15 @@ app.post("/getRideOptions", async (req, res) => {
 
       const best = matches[0];
 
-      const pricingId = best.vehicle.pricingCategory;
-
-      const pricingDoc = await db
-        .collection("pricing")
-        .doc(pricingId)
-        .get();
+      const pricingDoc = await db.collection("pricing").doc(best.vehicle.pricingCategory).get();
 
       let baseFare = 40;
-
       if (pricingDoc.exists) {
         const pdata = pricingDoc.data() || {};
-
-        baseFare =
-          pdata.baseFare ||
-          pdata.base ||
-          pdata.startingFare ||
-          40;
+        baseFare = pdata.baseFare || pdata.base || pdata.startingFare || 40;
       }
 
-      const eta = Math.max(
-        2,
-        Math.round(best.distance * 2)
-      );
-
+      const eta = Math.max(2, Math.round(best.distance * 2));
       const price = calculateFare(baseFare, tripKm);
 
       cards.push({
@@ -394,7 +360,6 @@ app.post("/getRideOptions", async (req, res) => {
 
   } catch (error) {
     console.error(error);
-
     return res.status(500).json({
       error: error.message
     });
