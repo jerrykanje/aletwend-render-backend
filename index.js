@@ -1,4 +1,4 @@
- const express = require("express");
+const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 
@@ -44,7 +44,7 @@ app.get("/testfirestore", async (req, res) => {
 });
 
 /* =======================================================
-   🚗 SAVE DRIVER VEHICLE
+   🚗 SAVE DRIVER VEHICLE (UPDATED FOR MULTI-SERVICE)
 ======================================================= */
 app.post("/classifyVehicleAndSaveDriver", async (req, res) => {
   try {
@@ -75,54 +75,51 @@ app.post("/classifyVehicleAndSaveDriver", async (req, res) => {
 
     const imageUrls = body.imageUrls || {};
 
-    let vehicleCategory = "";
-    let pricingCategory = "";
+    let vehicleCategories = [];
+    let pricingCategories = [];
     let maxSeats = 0;
 
-    switch (type) {
-      case "car":
-        if (services.includes("ride")) {
-          vehicleCategory = "economy";
-          pricingCategory = "ride_economy";
-          maxSeats = 3;
-        } else {
-          vehicleCategory = "delivery_car";
-          pricingCategory = "delivery_car";
-        }
-        break;
+    /* ===== VEHICLE CLASSIFICATION ===== */
 
-      case "minibus":
-        vehicleCategory = "xl";
-        pricingCategory = "ride_xl";
-        maxSeats = 10;
-        break;
+    if (type === "car") {
+      if (services.includes("ride")) {
+        vehicleCategories.push("economy");
+        pricingCategories.push("ride_economy");
+        maxSeats = 3;
+      }
 
-      case "bicycle":
-        vehicleCategory = "delivery_bicycle";
-        pricingCategory = "delivery_bicycle";
-        break;
+      if (services.includes("courier") || services.includes("delivery")) {
+        vehicleCategories.push("delivery_car");
+        pricingCategories.push("delivery_car");
+      }
+    }
 
-      case "motorbike":
-        vehicleCategory = "delivery_motorbike";
-        pricingCategory = "delivery_motorbike";
-        break;
+    if (type === "minibus") {
+      vehicleCategories.push("xl");
+      pricingCategories.push("ride_xl");
+      maxSeats = 10;
+    }
 
-      case "truck":
-        vehicleCategory = "delivery_truck";
+    if (type === "bicycle") {
+      vehicleCategories.push("delivery_bicycle");
+      pricingCategories.push("delivery_bicycle");
+    }
 
-        if (cargoType === "open") {
-          pricingCategory = `truck_${tonnage}ton`;
-        } else if (refrigerationType === "refrigerated") {
-          pricingCategory = `refrigerated_truck_${tonnage}ton`;
-        } else {
-          pricingCategory = `enclosed_truck_${tonnage}ton`;
-        }
-        break;
+    if (type === "motorbike") {
+      vehicleCategories.push("delivery_motorbike");
+      pricingCategories.push("delivery_motorbike");
+    }
 
-      default:
-        return res.status(400).json({
-          error: "Invalid vehicle type"
-        });
+    if (type === "truck") {
+      vehicleCategories.push("delivery_truck");
+
+      if (cargoType === "open") {
+        pricingCategories.push(`truck_${tonnage}ton`);
+      } else if (refrigerationType === "refrigerated") {
+        pricingCategories.push(`refrigerated_truck_${tonnage}ton`);
+      } else {
+        pricingCategories.push(`enclosed_truck_${tonnage}ton`);
+      }
     }
 
     const vehicle = {
@@ -136,8 +133,8 @@ app.post("/classifyVehicleAndSaveDriver", async (req, res) => {
       cargoType,
       refrigerationType,
       tonnage,
-      vehicleCategory,
-      pricingCategory,
+      vehicleCategory: vehicleCategories,
+      pricingCategory: pricingCategories,
       maxSeats,
       carImage: val(imageUrls.carImage),
       vehicleLicense: val(imageUrls.vehicleLicense),
@@ -158,8 +155,8 @@ app.post("/classifyVehicleAndSaveDriver", async (req, res) => {
 
     return res.json({
       success: true,
-      vehicleCategory,
-      pricingCategory,
+      vehicleCategories,
+      pricingCategories,
       maxSeats
     });
 
@@ -212,7 +209,7 @@ function titleCase(cat) {
 }
 
 /* =======================================================
-   🚕 GET RIDE OPTIONS (SERVICE-TYPE AWARE)
+   🚕 GET RIDE OPTIONS (FULLY FIXED)
 ======================================================= */
 app.post("/getRideOptions", async (req, res) => {
   try {
@@ -297,21 +294,27 @@ app.post("/getRideOptions", async (req, res) => {
       });
     });
 
+    const hasCategory = (arrOrStr, value) =>
+      Array.isArray(arrOrStr)
+        ? arrOrStr.includes(value)
+        : arrOrStr === value;
+
     const cards = [];
 
     for (const category of categories) {
 
       let matches = drivers.filter((x) => {
+
         if (serviceType === "ride") {
-          if (category === "economy") return x.vehicle.vehicleCategory === "economy";
-          if (category === "xl") return x.vehicle.vehicleCategory === "xl";
-          if (category === "comfort") return x.vehicle.pricingCategory === "ride_comfort";
-          if (category === "premium") return x.vehicle.pricingCategory === "ride_premium";
-          if (category === "women") return x.vehicle.pricingCategory === "ride_women";
-          if (category === "aletwende") return x.vehicle.pricingCategory === "ride_aletwende";
+          if (category === "economy") return hasCategory(x.vehicle.vehicleCategory, "economy");
+          if (category === "xl") return hasCategory(x.vehicle.vehicleCategory, "xl");
+          if (category === "comfort") return hasCategory(x.vehicle.pricingCategory, "ride_comfort");
+          if (category === "premium") return hasCategory(x.vehicle.pricingCategory, "ride_premium");
+          if (category === "women") return hasCategory(x.vehicle.pricingCategory, "ride_women");
+          if (category === "aletwende") return hasCategory(x.vehicle.pricingCategory, "ride_aletwende");
         }
 
-        return x.vehicle.vehicleCategory === category;
+        return hasCategory(x.vehicle.vehicleCategory, category);
       });
 
       matches.sort((a, b) => {
@@ -334,7 +337,17 @@ app.post("/getRideOptions", async (req, res) => {
 
       const best = matches[0];
 
-      const pricingDoc = await db.collection("pricing").doc(best.vehicle.pricingCategory).get();
+      let pricingKey;
+
+      if (Array.isArray(best.vehicle.pricingCategory)) {
+        pricingKey = best.vehicle.pricingCategory.find(p =>
+          p.includes(category)
+        );
+      } else {
+        pricingKey = best.vehicle.pricingCategory;
+      }
+
+      const pricingDoc = await db.collection("pricing").doc(pricingKey).get();
 
       let baseFare = 40;
       if (pricingDoc.exists) {
