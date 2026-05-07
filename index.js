@@ -46,14 +46,21 @@ app.get("/testfirestore", async (req, res) => {
     await db.collection("test").doc("ping").set({
       time: new Date().toISOString()
     });
+
     res.json({ success: true });
+
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error(error);
+
+    res.status(500).json({
+      error: error.message
+    });
   }
 });
 
 /* =======================================================
-   🚗 SAVE DRIVER VEHICLE (DYNAMIC FIX)
+   🚗 SAVE DRIVER VEHICLE
+   ✅ FIXED TO USE defaultRideCategory
 ======================================================= */
 app.post("/classifyVehicleAndSaveDriver", async (req, res) => {
   try {
@@ -63,7 +70,9 @@ app.post("/classifyVehicleAndSaveDriver", async (req, res) => {
     const type = val(body.type).toLowerCase();
 
     if (!uid || !type) {
-      return res.status(400).json({ error: "Missing uid or type" });
+      return res.status(400).json({
+        error: "Missing uid or type"
+      });
     }
 
     const brand = val(body.brand);
@@ -72,12 +81,16 @@ app.post("/classifyVehicleAndSaveDriver", async (req, res) => {
     const plateNumber = val(body.plateNumber);
     const color = val(body.color);
 
-    let services = Array.isArray(body.services) ? body.services : [];
+    let services = Array.isArray(body.services)
+      ? body.services
+      : [];
 
     const cargoType = val(body.cargoType);
     const refrigerationType = val(body.refrigerationType);
 
-    const vehicleType = val(body.vehicleType || body.model).toLowerCase();
+    const vehicleType = val(
+      body.vehicleType || body.model
+    ).toLowerCase();
 
     const imageUrls = body.imageUrls || {};
 
@@ -87,33 +100,105 @@ app.post("/classifyVehicleAndSaveDriver", async (req, res) => {
     let tonnage = null;
 
     /* =======================================================
-       🚗 CAR (🔥 FIXED: USE RULES)
+       🚗 CAR
+       ✅ USE defaultRideCategory
     ======================================================= */
     if (type === "car") {
-      const vehicleKey = `${brand}_${model}`.toLowerCase().replace(/\s+/g, "_");
 
-      const rulesDoc = await db.collection("vehicle_service_rules").doc(vehicleKey).get();
+      const vehicleKey = `${brand}_${model}`
+        .toLowerCase()
+        .replace(/\s+/g, "_");
+
+      const rulesDoc = await db
+        .collection("vehicle_service_rules")
+        .doc(vehicleKey)
+        .get();
 
       if (rulesDoc.exists) {
-        const rules = rulesDoc.data();
 
-        const allowedRideCategories = rules.allowedRideCategories || [];
-        const defaultRideCategory = rules.defaultRideCategory?.[0];
+        const rules = rulesDoc.data() || {};
 
-        vehicleCategories = [...allowedRideCategories];
+        const allowedRideCategories =
+          Array.isArray(rules.allowedRideCategories)
+            ? rules.allowedRideCategories
+            : [];
 
-        pricingCategories = allowedRideCategories.map(cat => `ride_${cat}`);
+        const defaultRideCategory =
+          Array.isArray(rules.defaultRideCategory)
+            ? rules.defaultRideCategory[0]
+            : null;
 
-        if (defaultRideCategory) {
-          const catDoc = await db.collection("ride_categories").doc(defaultRideCategory).get();
+        /* =======================================================
+           ✅ IMPORTANT FIX
+           ONLY SAVE defaultRideCategory
+           NOT allowedRideCategories
+        ======================================================= */
+        if (
+          services.includes("ride") &&
+          defaultRideCategory
+        ) {
+
+          vehicleCategories.push(defaultRideCategory);
+
+          pricingCategories.push(
+            `ride_${defaultRideCategory}`
+          );
+
+          const catDoc = await db
+            .collection("ride_categories")
+            .doc(defaultRideCategory)
+            .get();
+
           if (catDoc.exists) {
-            maxSeats = catDoc.data().maxPassengers || 4;
+            maxSeats =
+              catDoc.data().maxPassengers || 4;
+          } else {
+            maxSeats = 4;
+          }
+        }
+
+        /* =======================================================
+           FALLBACK IF DEFAULT MISSING
+        ======================================================= */
+        if (
+          services.includes("ride") &&
+          !defaultRideCategory &&
+          allowedRideCategories.length > 0
+        ) {
+
+          const fallbackCategory =
+            allowedRideCategories[0];
+
+          vehicleCategories.push(fallbackCategory);
+
+          pricingCategories.push(
+            `ride_${fallbackCategory}`
+          );
+
+          const catDoc = await db
+            .collection("ride_categories")
+            .doc(fallbackCategory)
+            .get();
+
+          if (catDoc.exists) {
+            maxSeats =
+              catDoc.data().maxPassengers || 4;
+          } else {
+            maxSeats = 4;
           }
         }
       }
 
-      if (services.includes("courier") || services.includes("delivery")) {
+      /* =======================================================
+         DELIVERY + COURIER SUPPORT
+      ======================================================= */
+      if (
+        services.includes("courier") ||
+        services.includes("delivery")
+      ) {
+
         vehicleCategories.push("delivery_car");
+
         pricingCategories.push("delivery_car");
       }
     }
@@ -122,30 +207,58 @@ app.post("/classifyVehicleAndSaveDriver", async (req, res) => {
        🏍️ MOTORBIKE
     ======================================================= */
     if (type === "motorbike") {
+
       services = ["delivery", "courier"];
-      vehicleCategories.push("delivery_motorbike");
-      pricingCategories.push("delivery_motorbike");
+
+      vehicleCategories.push(
+        "delivery_motorbike"
+      );
+
+      pricingCategories.push(
+        "delivery_motorbike"
+      );
     }
 
     /* =======================================================
        🚚 TRUCK
     ======================================================= */
     if (type === "truck") {
+
       services = ["delivery", "delivery_truck"];
 
       const master = TRUCK_MASTER[vehicleType];
-      if (!master) return res.status(400).json({ error: "Unknown truck type" });
+
+      if (!master) {
+        return res.status(400).json({
+          error: "Unknown truck type"
+        });
+      }
 
       tonnage = master.tonnage;
 
-      vehicleCategories.push("delivery_truck");
+      vehicleCategories.push(
+        "delivery_truck"
+      );
 
-      if (refrigerationType === "refrigerated") {
-        pricingCategories.push(`refrigerated_truck_${tonnage}ton`);
+      if (
+        refrigerationType === "refrigerated"
+      ) {
+
+        pricingCategories.push(
+          `refrigerated_truck_${tonnage}ton`
+        );
+
       } else if (cargoType === "open") {
-        pricingCategories.push(`open_truck_${tonnage}ton`);
+
+        pricingCategories.push(
+          `open_truck_${tonnage}ton`
+        );
+
       } else {
-        pricingCategories.push(`closed_truck_${tonnage}ton`);
+
+        pricingCategories.push(
+          `closed_truck_${tonnage}ton`
+        );
       }
     }
 
@@ -153,9 +266,13 @@ app.post("/classifyVehicleAndSaveDriver", async (req, res) => {
        🚌 MINIBUS
     ======================================================= */
     if (type === "minibus") {
+
       services = ["ride"];
+
       vehicleCategories.push("xxl");
+
       pricingCategories.push("ride_xxl");
+
       maxSeats = 10;
     }
 
@@ -163,11 +280,32 @@ app.post("/classifyVehicleAndSaveDriver", async (req, res) => {
        🚲 BICYCLE
     ======================================================= */
     if (type === "bicycle") {
+
       services = ["delivery", "courier"];
-      vehicleCategories.push("delivery_bicycle");
-      pricingCategories.push("delivery_bicycle");
+
+      vehicleCategories.push(
+        "delivery_bicycle"
+      );
+
+      pricingCategories.push(
+        "delivery_bicycle"
+      );
     }
 
+    /* =======================================================
+       REMOVE DUPLICATES
+    ======================================================= */
+    vehicleCategories = [
+      ...new Set(vehicleCategories)
+    ];
+
+    pricingCategories = [
+      ...new Set(pricingCategories)
+    ];
+
+    /* =======================================================
+       VEHICLE OBJECT
+    ======================================================= */
     const vehicle = {
       type,
       brand,
@@ -179,28 +317,59 @@ app.post("/classifyVehicleAndSaveDriver", async (req, res) => {
       cargoType,
       refrigerationType,
       tonnage,
+
       vehicleCategory: vehicleCategories,
+
       pricingCategory: pricingCategories,
+
       maxSeats,
+
       carImage: val(imageUrls.carImage),
-      vehicleLicense: val(imageUrls.vehicleLicense),
-      registrationCertificate: val(imageUrls.registrationCertificate)
+
+      vehicleLicense: val(
+        imageUrls.vehicleLicense
+      ),
+
+      registrationCertificate: val(
+        imageUrls.registrationCertificate
+      )
     };
 
-    await db.collection("drivers").doc(uid).set(
-      {
-        uid,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        registrationStep: 6,
-        vehicle
-      },
-      { merge: true }
-    );
+    /* =======================================================
+       SAVE DRIVER
+    ======================================================= */
+    await db
+      .collection("drivers")
+      .doc(uid)
+      .set(
+        {
+          uid,
 
-    return res.json({ success: true, vehicleCategories, pricingCategories });
+          updatedAt:
+            admin.firestore.FieldValue.serverTimestamp(),
+
+          registrationStep: 6,
+
+          vehicle
+        },
+        { merge: true }
+      );
+
+    return res.json({
+      success: true,
+      vehicleCategories,
+      pricingCategories,
+      maxSeats,
+      tonnage
+    });
 
   } catch (error) {
-    return res.status(500).json({ error: error.message });
+
+    console.error(error);
+
+    return res.status(500).json({
+      error: error.message
+    });
   }
 });
 
@@ -208,125 +377,304 @@ app.post("/classifyVehicleAndSaveDriver", async (req, res) => {
    HELPERS
 ======================================================= */
 
-function haversine(lat1, lon1, lat2, lon2) {
+function haversine(
+  lat1,
+  lon1,
+  lat2,
+  lon2
+) {
   const R = 6371;
-  const dLat = (lat2 - lat1) * Math.PI / 180;
-  const dLon = (lon2 - lon1) * Math.PI / 180;
+
+  const dLat =
+    ((lat2 - lat1) * Math.PI) / 180;
+
+  const dLon =
+    ((lon2 - lon1) * Math.PI) / 180;
 
   const a =
     Math.sin(dLat / 2) ** 2 +
-    Math.cos(lat1 * Math.PI / 180) *
-    Math.cos(lat2 * Math.PI / 180) *
-    Math.sin(dLon / 2) ** 2;
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLon / 2) ** 2;
 
-  return R * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+  return (
+    R *
+    (2 *
+      Math.atan2(
+        Math.sqrt(a),
+        Math.sqrt(1 - a)
+      ))
+  );
 }
 
 function calculateFare(baseFare, km) {
-  return Math.round(baseFare + (km * 6));
+  return Math.round(baseFare + km * 6);
 }
 
 /* =======================================================
-   🚕 GET RIDE OPTIONS (🔥 FULLY FIXED LOGIC)
+   🚕 GET RIDE OPTIONS
 ======================================================= */
 app.post("/getRideOptions", async (req, res) => {
+
   try {
+
     const body = req.body || {};
 
     const pickupLat = Number(body.pickupLat);
     const pickupLng = Number(body.pickupLng);
+
     const dropLat = Number(body.dropLat);
     const dropLng = Number(body.dropLng);
 
-    const serviceType = (body.serviceType || "ride").toLowerCase();
-    const kg = body.kg || "0-5kg";
-    const deliveryType = body.deliveryType || "";
+    const serviceType = val(
+      body.serviceType || "ride"
+    ).toLowerCase();
 
-    const tripKm = haversine(pickupLat, pickupLng, dropLat, dropLng);
+    const kg = val(body.kg || "0-5kg");
+
+    const deliveryType = val(
+      body.deliveryType
+    ).toLowerCase();
+
+    const tripKm = haversine(
+      pickupLat,
+      pickupLng,
+      dropLat,
+      dropLng
+    );
 
     let categories = [];
 
     /* =======================================================
-       🔥 SERVICE LOGIC (FIXED PROPERLY)
+       🚗 RIDE
     ======================================================= */
-
     if (serviceType === "ride") {
-      categories = ["economy", "comfort", "premium", "women", "aletwende", "xl", "xxl"];
-    }
 
-    if (serviceType === "courier") {
-      categories = ["delivery_bicycle", "delivery_motorbike", "delivery_car"];
-    }
-
-    if (serviceType === "delivery") {
-      // 🔥 INCLUDE EVERYTHING (WITH KG LOGIC)
-      if (kg === "0-5kg") categories = ["delivery_bicycle"];
-      else if (kg === "5-20kg") categories = ["delivery_motorbike"];
-      else if (kg === "20-100kg") categories = ["delivery_car"];
-      else categories = ["delivery_truck"];
-    }
-
-    if (serviceType === "delivery_truck") {
-      categories = ["delivery_truck"];
+      categories = [
+        "economy",
+        "comfort",
+        "premium",
+        "women",
+        "aletwende",
+        "xl",
+        "xxl"
+      ];
     }
 
     /* =======================================================
-       FETCH DRIVERS
+       📦 COURIER
+       ONLY bicycle + motorbike + car
     ======================================================= */
-    const onlineSnap = await rtdb.ref("drivers_online").once("value");
-    const locationSnap = await rtdb.ref("driver_locations").once("value");
+    if (serviceType === "courier") {
 
-    const online = onlineSnap.val() || {};
-    const locations = locationSnap.val() || {};
+      categories = [
+        "delivery_bicycle",
+        "delivery_motorbike",
+        "delivery_car"
+      ];
+    }
 
-    const driversSnap = await db.collection("drivers").get();
+    /* =======================================================
+       🚚 DELIVERY
+       ✅ RECOMMEND BEST VEHICLE USING KG
+       ✅ CAN LOAD BICYCLE/MOTORBIKE/CAR/TRUCK
+    ======================================================= */
+    if (serviceType === "delivery") {
+
+      if (kg === "0-5kg") {
+
+        categories = [
+          "delivery_bicycle",
+          "delivery_motorbike",
+          "delivery_car",
+          "delivery_truck"
+        ];
+
+      } else if (
+        kg === "5-20kg"
+      ) {
+
+        categories = [
+          "delivery_motorbike",
+          "delivery_car",
+          "delivery_truck"
+        ];
+
+      } else if (
+        kg === "20-100kg"
+      ) {
+
+        categories = [
+          "delivery_car",
+          "delivery_truck"
+        ];
+
+      } else {
+
+        categories = [
+          "delivery_truck"
+        ];
+      }
+    }
+
+    /* =======================================================
+       🚛 DELIVERY TRUCK
+       ONLY TRUCKS
+    ======================================================= */
+    if (
+      serviceType === "delivery_truck"
+    ) {
+
+      categories = [
+        "delivery_truck"
+      ];
+    }
+
+    /* =======================================================
+       FETCH ONLINE DRIVERS
+    ======================================================= */
+    const onlineSnap = await rtdb
+      .ref("drivers_online")
+      .once("value");
+
+    const locationSnap = await rtdb
+      .ref("driver_locations")
+      .once("value");
+
+    const online =
+      onlineSnap.val() || {};
+
+    const locations =
+      locationSnap.val() || {};
+
+    const driversSnap = await db
+      .collection("drivers")
+      .get();
 
     const drivers = [];
 
     driversSnap.forEach((doc) => {
+
       const d = doc.data() || {};
+
       const uid = d.uid || doc.id;
 
       if (!uid) return;
-      if (!online[uid]?.isOnline) return;
-      if (online[uid]?.isBusy) return;
-      if (!locations[uid]?.l) return;
-      if (!d.vehicle) return;
 
-      if (!d.vehicle.services.includes(serviceType)) return;
+      if (!online[uid]?.isOnline)
+        return;
 
-      const lat = Number(locations[uid].l[0]);
-      const lng = Number(locations[uid].l[1]);
+      if (online[uid]?.isBusy)
+        return;
 
-      const distance = haversine(pickupLat, pickupLng, lat, lng);
-      if (distance > 7) return;
+      if (!locations[uid]?.l)
+        return;
 
-      drivers.push({ uid, distance, vehicle: d.vehicle });
+      if (!d.vehicle)
+        return;
+
+      if (
+        !Array.isArray(
+          d.vehicle.services
+        )
+      ) {
+        return;
+      }
+
+      /* =======================================================
+         SERVICE CHECK
+      ======================================================= */
+      if (
+        !d.vehicle.services.includes(
+          serviceType
+        )
+      ) {
+        return;
+      }
+
+      const lat = Number(
+        locations[uid].l[0]
+      );
+
+      const lng = Number(
+        locations[uid].l[1]
+      );
+
+      const distance = haversine(
+        pickupLat,
+        pickupLng,
+        lat,
+        lng
+      );
+
+      if (distance > 7)
+        return;
+
+      drivers.push({
+        uid,
+        distance,
+        vehicle: d.vehicle
+      });
     });
 
     /* =======================================================
-       🚚 TRUCK PRIORITY SORT
+       🚚 SMART TRUCK SORTING
     ======================================================= */
-    if (serviceType === "delivery_truck") {
+    if (
+      serviceType === "delivery_truck"
+    ) {
+
       drivers.sort((a, b) => {
-        if (deliveryType === "farm-produce") {
+
+        /* =======================================================
+           REFRIGERATED PRIORITY
+        ======================================================= */
+        if (
+          deliveryType ===
+            "farm-produce" ||
+          deliveryType ===
+            "meat" ||
+          deliveryType ===
+            "frozen-food" ||
+          deliveryType ===
+            "drinks"
+        ) {
+
           return (
-            (b.vehicle.refrigerationType === "refrigerated") -
-            (a.vehicle.refrigerationType === "refrigerated")
+            (b.vehicle
+              .refrigerationType ===
+            "refrigerated") -
+            (a.vehicle
+              .refrigerationType ===
+            "refrigerated")
           );
         }
-        return a.distance - b.distance;
+
+        return (
+          a.distance -
+          b.distance
+        );
       });
     }
 
+    /* =======================================================
+       BUILD CARDS
+    ======================================================= */
     const cards = [];
 
     for (const category of categories) {
-      const match = drivers.find(d =>
-        d.vehicle.vehicleCategory.includes(category)
+
+      const match = drivers.find((d) =>
+        d.vehicle.vehicleCategory.includes(
+          category
+        )
       );
 
+      /* =======================================================
+         NO VEHICLE FOUND
+      ======================================================= */
       if (!match) {
+
         cards.push({
           category,
           title: category,
@@ -336,22 +684,48 @@ app.post("/getRideOptions", async (req, res) => {
           seats: null,
           image: `${category}.png`
         });
+
         continue;
       }
 
-      const pricingKey =
-        match.vehicle.pricingCategory.find(p => p.includes(category)) ||
-        match.vehicle.pricingCategory[0];
+      /* =======================================================
+         PRICING
+      ======================================================= */
+      let pricingKey =
+        match.vehicle.pricingCategory.find(
+          (p) =>
+            p.includes(category)
+        );
 
-      const pricingDoc = await db.collection("pricing").doc(pricingKey).get();
-
-      let baseFare = 40;
-      if (pricingDoc.exists) {
-        baseFare = pricingDoc.data().baseFare || 40;
+      if (!pricingKey) {
+        pricingKey =
+          match.vehicle.pricingCategory[0];
       }
 
-      const eta = Math.max(2, Math.round(match.distance * 2));
-      const price = calculateFare(baseFare, tripKm);
+      const pricingDoc = await db
+        .collection("pricing")
+        .doc(pricingKey)
+        .get();
+
+      let baseFare = 40;
+
+      if (pricingDoc.exists) {
+
+        baseFare =
+          pricingDoc.data().baseFare || 40;
+      }
+
+      const eta = Math.max(
+        2,
+        Math.round(
+          match.distance * 2
+        )
+      );
+
+      const price = calculateFare(
+        baseFare,
+        tripKm
+      );
 
       cards.push({
         category,
@@ -359,7 +733,8 @@ app.post("/getRideOptions", async (req, res) => {
         enabled: true,
         eta,
         price,
-        seats: match.vehicle.maxSeats || 4,
+        seats:
+          match.vehicle.maxSeats || 4,
         image: `${category}.png`
       });
     }
@@ -367,7 +742,12 @@ app.post("/getRideOptions", async (req, res) => {
     return res.json(cards);
 
   } catch (error) {
-    return res.status(500).json({ error: error.message });
+
+    console.error(error);
+
+    return res.status(500).json({
+      error: error.message
+    });
   }
 });
 
@@ -381,8 +761,11 @@ app.get("/", (req, res) => {
 /* =======================================================
    START SERVER
 ======================================================= */
-const PORT = process.env.PORT || 3000;
+const PORT =
+  process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(
+    `Server running on port ${PORT}`
+  );
 });
