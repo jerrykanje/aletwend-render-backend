@@ -980,8 +980,20 @@ app.post("/getRideOptions", async (req, res) => {
           continue;
         }
 
-        const pricingKey =
-          item.match.vehicle.pricingCategory[0];
+        /* =======================================================
+           🔥 MODIFIED PRICING KEY LOGIC
+        ======================================================= */
+
+        let pricingKey =
+          item.match.vehicle.pricingCategory.find(
+            p => p.includes(item.key)
+          );
+
+        if (!pricingKey) {
+
+          pricingKey =
+            item.match.vehicle.pricingCategory[0];
+        }
 
         const pricingDoc =
           await db
