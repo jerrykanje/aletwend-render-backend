@@ -342,18 +342,13 @@ app.post(
         tonnage =
           master.tonnage;
 
-        /* =======================================================
-           UNIVERSAL CATEGORY
-        ======================================================= */
-
         vehicleCategories.push(
           "delivery_truck"
         );
 
         /* =======================================================
-           OPEN TRUCK
+           🚚 OPEN TRUCK
         ======================================================= */
-
         if (
           cargoType === "open"
         ) {
@@ -362,18 +357,9 @@ app.post(
             "open_truck"
           );
 
-          /* =======================================================
-             UNIVERSAL HARDWARE PRICING
-          ======================================================= */
-
           pricingCategories.push(
             "open_truck"
           );
-
-          /* =======================================================
-             REAL TONNAGE PRICING
-             USED AFTER DISPATCH
-          ======================================================= */
 
           if (
             tonnage === 1.5
@@ -392,26 +378,17 @@ app.post(
         }
 
         /* =======================================================
-           CLOSED / ENCLOSED TRUCK
+           🚚 CLOSED TRUCK
         ======================================================= */
-
         else {
 
           vehicleCategories.push(
             "closed_truck"
           );
 
-          /* =======================================================
-             UNIVERSAL HARDWARE PRICING
-          ======================================================= */
-
           pricingCategories.push(
             "closed_truck"
           );
-
-          /* =======================================================
-             REFRIGERATED
-          ======================================================= */
 
           if (
 
@@ -433,9 +410,8 @@ app.post(
         }
 
         /* =======================================================
-           GENERIC DELIVERY TRUCK
+           🚚 GENERIC DELIVERY TRUCK
         ======================================================= */
-
         if (
 
           refrigerationType ===
@@ -513,7 +489,6 @@ app.post(
       /* =======================================================
          REMOVE DUPLICATES
       ======================================================= */
-
       vehicleCategories = [
         ...new Set(vehicleCategories)
       ];
@@ -525,7 +500,6 @@ app.post(
       /* =======================================================
          SAVE VEHICLE
       ======================================================= */
-
       const vehicle = {
 
         type,
@@ -808,6 +782,424 @@ function isRecommendedTruck(
 }
 
 /* =======================================================
+   🔥 FIND DRIVER FOR REQUEST
+======================================================= */
+async function findDriverForRequest(
+  orderData
+) {
+
+  try {
+
+    const pickupLat =
+      Number(
+        orderData.pickupLat
+      );
+
+    const pickupLng =
+      Number(
+        orderData.pickupLng
+      );
+
+    const dispatchService =
+      val(
+        orderData.dispatchService
+      );
+
+    if (
+      !dispatchService
+    ) {
+
+      return null;
+    }
+
+    const onlineSnap =
+      await rtdb
+        .ref(
+          "drivers_online"
+        )
+        .once("value");
+
+    const locationSnap =
+      await rtdb
+        .ref(
+          "driver_locations"
+        )
+        .once("value");
+
+    const online =
+      onlineSnap.val() || {};
+
+    const locations =
+      locationSnap.val() || {};
+
+    const driversSnap =
+      await db
+        .collection(
+          "drivers"
+        )
+        .get();
+
+    let matches = [];
+
+    driversSnap.forEach(
+      (doc) => {
+
+        const d =
+          doc.data() || {};
+
+        const uid =
+          d.uid || doc.id;
+
+        if (!uid) return;
+
+        if (
+          !online[uid]
+            ?.isOnline
+        ) return;
+
+        if (
+          online[uid]
+            ?.isBusy
+        ) return;
+
+        if (
+          !locations[uid]
+            ?.l
+        ) return;
+
+        if (
+          !d.vehicle
+        ) return;
+
+        const pricing =
+          d.vehicle
+            ?.pricingCategory || [];
+
+        const categories =
+          d.vehicle
+            ?.vehicleCategory || [];
+
+        const matched =
+
+          pricing.includes(
+            dispatchService
+          ) ||
+
+          categories.includes(
+            dispatchService
+          );
+
+        if (
+          !matched
+        ) return;
+
+        const lat =
+          Number(
+            locations[
+              uid
+            ].l[0]
+          );
+
+        const lng =
+          Number(
+            locations[
+              uid
+            ].l[1]
+          );
+
+        const distance =
+          haversine(
+
+            pickupLat,
+
+            pickupLng,
+
+            lat,
+
+            lng
+          );
+
+        matches.push({
+
+          uid,
+
+          distance
+        });
+      }
+    );
+
+    matches.sort(
+      (a, b) =>
+        a.distance -
+        b.distance
+    );
+
+    return matches[0] || null;
+
+  } catch (error) {
+
+    console.log(
+      "findDriverForRequest error",
+      error
+    );
+
+    return null;
+  }
+}
+
+/* =======================================================
+   🔥 DISPATCH STORE DELIVERY
+======================================================= */
+async function dispatchStoreDelivery(
+  orderId,
+  orderData
+) {
+
+  try {
+
+    await db
+      .collection("requests")
+      .doc(orderId)
+      .update({
+
+        driverStatus:
+          "searching"
+      });
+
+    const driver =
+      await findDriverForRequest(
+        orderData
+      );
+
+    if (
+      !driver
+    ) {
+
+      console.log(
+        "No driver found"
+      );
+
+      return;
+    }
+
+    await db
+      .collection("requests")
+      .doc(orderId)
+      .update({
+
+        driverId:
+          driver.uid,
+
+        driverStatus:
+          "assigned",
+
+        status:
+          "driver_assigned"
+      });
+
+    await rtdb
+      .ref(
+        `drivers_online/${driver.uid}`
+      )
+      .update({
+
+        isBusy: true
+      });
+
+    console.log(
+      "Store delivery assigned"
+    );
+
+  } catch (error) {
+
+    console.log(
+      "dispatchStoreDelivery error",
+      error
+    );
+  }
+}
+
+/* =======================================================
+   🔥 DISPATCH DIRECT TRIP
+======================================================= */
+async function dispatchDirectTrip(
+  orderId,
+  orderData
+) {
+
+  try {
+
+    await db
+      .collection("requests")
+      .doc(orderId)
+      .update({
+
+        driverStatus:
+          "searching"
+      });
+
+    const driver =
+      await findDriverForRequest(
+        orderData
+      );
+
+    if (
+      !driver
+    ) {
+
+      console.log(
+        "No driver found"
+      );
+
+      return;
+    }
+
+    await db
+      .collection("requests")
+      .doc(orderId)
+      .update({
+
+        driverId:
+          driver.uid,
+
+        driverStatus:
+          "assigned"
+      });
+
+    await rtdb
+      .ref(
+        `drivers_online/${driver.uid}`
+      )
+      .update({
+
+        isBusy: true
+      });
+
+    console.log(
+      "Direct trip assigned"
+    );
+
+  } catch (error) {
+
+    console.log(
+      "dispatchDirectTrip error",
+      error
+    );
+  }
+}
+
+/* =======================================================
+   🔥 FIRESTORE REQUEST LISTENER
+======================================================= */
+db.collection("requests")
+  .onSnapshot(
+    async (snapshot) => {
+
+      for (
+        const change of
+        snapshot.docChanges()
+      ) {
+
+        if (
+
+          change.type !==
+          "modified"
+
+        ) {
+
+          continue;
+        }
+
+        const doc =
+          change.doc;
+
+        const data =
+          doc.data() || {};
+
+        const orderId =
+          doc.id;
+
+        const workflowType =
+          val(
+            data.workflowType
+          );
+
+        const status =
+          val(
+            data.status
+          );
+
+        const driverStatus =
+          val(
+            data.driverStatus
+          );
+
+        /* =======================================================
+           🏪 STORE DELIVERY
+        ======================================================= */
+        if (
+
+          workflowType ===
+          "store_delivery"
+
+        ) {
+
+          if (
+
+            status ===
+              "ready_for_pickup" &&
+
+            driverStatus ===
+              "waiting"
+
+          ) {
+
+            console.log(
+              "Starting store dispatch"
+            );
+
+            await dispatchStoreDelivery(
+              orderId,
+              data
+            );
+          }
+        }
+
+        /* =======================================================
+           🚕 DIRECT TRIP
+        ======================================================= */
+        if (
+
+          workflowType ===
+          "direct_trip"
+
+        ) {
+
+          if (
+
+            status ===
+              "pending" &&
+
+            driverStatus ===
+              "waiting"
+
+          ) {
+
+            console.log(
+              "Starting direct trip dispatch"
+            );
+
+            await dispatchDirectTrip(
+              orderId,
+              data
+            );
+          }
+        }
+      }
+    }
+  );
+
+/* =======================================================
    🚕 GET RIDE OPTIONS
 ======================================================= */
 app.post(
@@ -953,10 +1345,6 @@ app.post(
         ];
       }
 
-      /* =======================================================
-         FETCH ONLINE DRIVERS
-      ======================================================= */
-
       const onlineSnap =
         await rtdb
           .ref(
@@ -1069,7 +1457,7 @@ app.post(
       );
 
       /* =======================================================
-         SORT DELIVERY TRUCKS
+         🚚 DELIVERY_TRUCK
       ======================================================= */
       if (
 
@@ -1123,14 +1511,10 @@ app.post(
         );
       }
 
-      /* =======================================================
-         RESPONSE CARDS
-      ======================================================= */
       const cards = [];
 
       /* =======================================================
          🚚 DELIVERY_TRUCK
-         RETURN ALL TRUCKS
       ======================================================= */
       if (
 
@@ -1287,7 +1671,6 @@ app.post(
 
       /* =======================================================
          🚚 DELIVERY
-         HARDWARE PATH
       ======================================================= */
       if (
         serviceType ===
@@ -1330,10 +1713,6 @@ app.post(
                 )
           );
 
-        /* =======================================================
-           🚚 OPEN TRUCK
-        ======================================================= */
-
         let openTruck =
           drivers.find(
 
@@ -1345,10 +1724,6 @@ app.post(
                   "open_truck"
                 )
           );
-
-        /* =======================================================
-           🚚 CLOSED TRUCK
-        ======================================================= */
 
         let closedTruck =
           drivers.find(
