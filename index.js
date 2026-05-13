@@ -1,4 +1,4 @@
- const express = require("express");
+const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 
@@ -342,12 +342,98 @@ app.post(
         tonnage =
           master.tonnage;
 
+        /* =======================================================
+           UNIVERSAL CATEGORY
+        ======================================================= */
+
         vehicleCategories.push(
           "delivery_truck"
         );
 
         /* =======================================================
-           🚚 TRUCK PRICING CATEGORY
+           OPEN TRUCK
+        ======================================================= */
+
+        if (
+          cargoType === "open"
+        ) {
+
+          vehicleCategories.push(
+            "open_truck"
+          );
+
+          /* =======================================================
+             UNIVERSAL HARDWARE PRICING
+          ======================================================= */
+
+          pricingCategories.push(
+            "open_truck"
+          );
+
+          /* =======================================================
+             REAL TONNAGE PRICING
+             USED AFTER DISPATCH
+          ======================================================= */
+
+          if (
+            tonnage === 1.5
+          ) {
+
+            pricingCategories.push(
+              "open_truck_1.5ton"
+            );
+
+          } else {
+
+            pricingCategories.push(
+              `open_truck_${tonnage}ton`
+            );
+          }
+        }
+
+        /* =======================================================
+           CLOSED / ENCLOSED TRUCK
+        ======================================================= */
+
+        else {
+
+          vehicleCategories.push(
+            "closed_truck"
+          );
+
+          /* =======================================================
+             UNIVERSAL HARDWARE PRICING
+          ======================================================= */
+
+          pricingCategories.push(
+            "closed_truck"
+          );
+
+          /* =======================================================
+             REFRIGERATED
+          ======================================================= */
+
+          if (
+
+            refrigerationType ===
+            "refrigerated"
+
+          ) {
+
+            pricingCategories.push(
+              `refrigerated_truck_${tonnage}ton`
+            );
+
+          } else {
+
+            pricingCategories.push(
+              `enclosed_truck_${tonnage}ton`
+            );
+          }
+        }
+
+        /* =======================================================
+           GENERIC DELIVERY TRUCK
         ======================================================= */
 
         if (
@@ -362,37 +448,14 @@ app.post(
           );
 
         } else if (
-
-          cargoType ===
-          "open"
-
+          cargoType === "open"
         ) {
 
-          /* =======================================================
-             🔥 OPEN TRUCKS
-             USE EXISTING PRICING DOCS
-          ======================================================= */
-
-          if (
-            tonnage === 1.5
-          ) {
-
-            pricingCategories.push(
-              "open_truck_1.5ton"
-            );
-
-          } else {
-
-            pricingCategories.push(
-              `truck_${tonnage}ton`
-            );
-          }
+          pricingCategories.push(
+            `open_truck_${tonnage}ton`
+          );
 
         } else {
-
-          /* =======================================================
-             🔥 CLOSED / ENCLOSED TRUCKS
-          ======================================================= */
 
           pricingCategories.push(
             `enclosed_truck_${tonnage}ton`
@@ -446,6 +509,18 @@ app.post(
           "delivery_bicycle"
         );
       }
+
+      /* =======================================================
+         REMOVE DUPLICATES
+      ======================================================= */
+
+      vehicleCategories = [
+        ...new Set(vehicleCategories)
+      ];
+
+      pricingCategories = [
+        ...new Set(pricingCategories)
+      ];
 
       /* =======================================================
          SAVE VEHICLE
@@ -857,7 +932,9 @@ app.post(
 
           "delivery_car",
 
-          "delivery_truck"
+          "open_truck",
+
+          "closed_truck"
         ];
       }
 
@@ -1078,9 +1155,38 @@ app.post(
           const match of truckDrivers
         ) {
 
-          const pricingKey =
+          let pricingKey =
             match.vehicle
-              .pricingCategory[0];
+              .pricingCategory
+              .find(
+
+                (p) =>
+
+                  p.includes(
+                    "truck_"
+                  ) ||
+
+                  p.includes(
+                    "refrigerated_truck"
+                  ) ||
+
+                  p.includes(
+                    "enclosed_truck"
+                  ) ||
+
+                  p.includes(
+                    "open_truck_"
+                  )
+              );
+
+          if (
+            !pricingKey
+          ) {
+
+            pricingKey =
+              match.vehicle
+                .pricingCategory[0];
+          }
 
           const pricingDoc =
             await db
@@ -1225,7 +1331,7 @@ app.post(
           );
 
         /* =======================================================
-           🔥 OPEN TRUCK
+           🚚 OPEN TRUCK
         ======================================================= */
 
         let openTruck =
@@ -1233,17 +1339,15 @@ app.post(
 
             (d) =>
 
-              d.vehicle.type ===
-                "truck" &&
-
               d.vehicle
-                .cargoType ===
-                "open"
+                .vehicleCategory
+                .includes(
+                  "open_truck"
+                )
           );
 
         /* =======================================================
-           🔥 CLOSED TRUCK
-           ENCLOSED + REFRIGERATED
+           🚚 CLOSED TRUCK
         ======================================================= */
 
         let closedTruck =
@@ -1251,12 +1355,11 @@ app.post(
 
             (d) =>
 
-              d.vehicle.type ===
-                "truck" &&
-
               d.vehicle
-                .cargoType !==
-                "open"
+                .vehicleCategory
+                .includes(
+                  "closed_truck"
+                )
           );
 
         const deliveryMatches = [
@@ -1268,6 +1371,12 @@ app.post(
 
             title:
               "Bicycle",
+
+            dispatchService:
+              "delivery_bicycle",
+
+            pricingKey:
+              "delivery_bicycle",
 
             match:
               bicycle
@@ -1281,6 +1390,12 @@ app.post(
             title:
               "Motorbike",
 
+            dispatchService:
+              "delivery_motorbike",
+
+            pricingKey:
+              "delivery_motorbike",
+
             match:
               motorbike
           },
@@ -1292,6 +1407,12 @@ app.post(
 
             title:
               "Car",
+
+            dispatchService:
+              "delivery_car",
+
+            pricingKey:
+              "delivery_car",
 
             match:
               car
@@ -1305,6 +1426,12 @@ app.post(
             title:
               "Open Truck",
 
+            dispatchService:
+              "open_truck",
+
+            pricingKey:
+              "open_truck",
+
             match:
               openTruck
           },
@@ -1316,6 +1443,12 @@ app.post(
 
             title:
               "Closed Truck",
+
+            dispatchService:
+              "closed_truck",
+
+            pricingKey:
+              "closed_truck",
 
             match:
               closedTruck
@@ -1354,39 +1487,13 @@ app.post(
             continue;
           }
 
-          /* =======================================================
-             🔥 MODIFIED PRICING KEY LOGIC
-          ======================================================= */
-
-          let pricingKey =
-            item.match
-              .vehicle
-              .pricingCategory
-              .find(
-
-                (p) =>
-                  p.includes(
-                    item.key
-                  )
-              );
-
-          if (
-            !pricingKey
-          ) {
-
-            pricingKey =
-              item.match
-                .vehicle
-                .pricingCategory[0];
-          }
-
           const pricingDoc =
             await db
               .collection(
                 "pricing"
               )
               .doc(
-                pricingKey
+                item.pricingKey
               )
               .get();
 
@@ -1501,10 +1608,10 @@ app.post(
               item.title,
 
             dispatchService:
-              pricingKey,
+              item.dispatchService,
 
             pricingCategory:
-              pricingKey,
+              item.pricingKey,
 
             enabled:
               true,
