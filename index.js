@@ -782,9 +782,9 @@ function isRecommendedTruck(
 }
 
 /* =======================================================
-   🔥 FIND DRIVERS FOR REQUEST
+   🔥 FIND MATCHING DRIVER
 ======================================================= */
-async function findDriversForRequest(
+async function findMatchingDriver(
   orderData
 ) {
 
@@ -809,7 +809,7 @@ async function findDriversForRequest(
       !dispatchService
     ) {
 
-      return [];
+      return null;
     }
 
     const onlineSnap =
@@ -943,16 +943,16 @@ async function findDriversForRequest(
         b.distance
     );
 
-    return matches;
+    return matches[0] || null;
 
   } catch (error) {
 
     console.log(
-      "findDriversForRequest error",
+      "findMatchingDriver error",
       error
     );
 
-    return [];
+    return null;
   }
 }
 
@@ -1027,7 +1027,7 @@ async function dispatchStoreDelivery(
   try {
 
     await db
-      .collection("requests")
+      .collection("orders")
       .doc(orderId)
       .update({
 
@@ -1041,21 +1041,21 @@ async function dispatchStoreDelivery(
             .serverTimestamp()
       });
 
-    const drivers =
-      await findDriversForRequest(
+    const matchedDriver =
+      await findMatchingDriver(
         orderData
       );
 
     if (
-      !drivers.length
+      !matchedDriver
     ) {
 
       console.log(
-        "No drivers found"
+        "No driver found"
       );
 
       await db
-        .collection("requests")
+        .collection("orders")
         .doc(orderId)
         .update({
 
@@ -1066,22 +1066,29 @@ async function dispatchStoreDelivery(
       return;
     }
 
-    for (
-      const driver of drivers
-    ) {
+    await db
+      .collection("orders")
+      .doc(orderId)
+      .update({
 
-      await sendRequestToDriver(
+        driverId:
+          matchedDriver.uid,
 
-        orderId,
+        driverStatus:
+          "sent_to_driver"
+      });
 
-        orderData,
+    await sendRequestToDriver(
 
-        driver.uid
-      );
-    }
+      orderId,
+
+      orderData,
+
+      matchedDriver.uid
+    );
 
     console.log(
-      "Store delivery requests broadcasted"
+      "Store delivery request sent"
     );
 
   } catch (error) {
@@ -1104,7 +1111,7 @@ async function dispatchDirectTrip(
   try {
 
     await db
-      .collection("requests")
+      .collection("orders")
       .doc(orderId)
       .update({
 
@@ -1118,21 +1125,21 @@ async function dispatchDirectTrip(
             .serverTimestamp()
       });
 
-    const drivers =
-      await findDriversForRequest(
+    const matchedDriver =
+      await findMatchingDriver(
         orderData
       );
 
     if (
-      !drivers.length
+      !matchedDriver
     ) {
 
       console.log(
-        "No drivers found"
+        "No driver found"
       );
 
       await db
-        .collection("requests")
+        .collection("orders")
         .doc(orderId)
         .update({
 
@@ -1143,22 +1150,29 @@ async function dispatchDirectTrip(
       return;
     }
 
-    for (
-      const driver of drivers
-    ) {
+    await db
+      .collection("orders")
+      .doc(orderId)
+      .update({
 
-      await sendRequestToDriver(
+        driverId:
+          matchedDriver.uid,
 
-        orderId,
+        driverStatus:
+          "sent_to_driver"
+      });
 
-        orderData,
+    await sendRequestToDriver(
 
-        driver.uid
-      );
-    }
+      orderId,
+
+      orderData,
+
+      matchedDriver.uid
+    );
 
     console.log(
-      "Direct trip requests broadcasted"
+      "Direct trip request sent"
     );
 
   } catch (error) {
@@ -1204,7 +1218,7 @@ app.post(
 
       const orderRef =
         db
-          .collection("requests")
+          .collection("orders")
           .doc(orderId);
 
       const orderDoc =
@@ -1227,8 +1241,6 @@ app.post(
         orderDoc.data() || {};
 
       if (
-
-        orderData.driverId &&
 
         orderData.driverStatus ===
         "accepted"
@@ -1360,6 +1372,17 @@ app.post(
         )
         .remove();
 
+      await db
+        .collection("orders")
+        .doc(orderId)
+        .update({
+
+          driverStatus:
+            "waiting",
+
+          driverId: null
+        });
+
       return res.json({
 
         success: true
@@ -1379,9 +1402,9 @@ app.post(
 );
 
 /* =======================================================
-   🔥 FIRESTORE REQUEST LISTENER
+   🔥 FIRESTORE ORDERS LISTENER
 ======================================================= */
-db.collection("requests")
+db.collection("orders")
   .onSnapshot(
     async (snapshot) => {
 
@@ -1498,7 +1521,6 @@ db.collection("requests")
 /* =======================================================
    🚕 GET RIDE OPTIONS
 ======================================================= */
-
 app.post(
   "/getRideOptions",
   async (req, res) => {
@@ -1788,7 +1810,7 @@ app.post(
             eta:
               null,
 
-            price:
+              price:
               null,
 
             seats:
