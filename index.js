@@ -64,78 +64,9 @@ const TRUCK_MASTER = {
 };
 
 /* =======================================================
-   🔥 RTDB + FIRESTORE ORDER SYNC
+   🔥 DRIVER REQUEST CLEANUP ONLY
 ======================================================= */
-async function syncOrderToRTDB(
-  orderId,
-  orderData
-) {
-
-  try {
-
-    await rtdb
-      .ref(`orders/${orderId}`)
-      .update({
-
-        ...orderData,
-
-        updatedAt:
-          Date.now()
-      });
-
-  } catch (error) {
-
-    console.log(
-      "syncOrderToRTDB error",
-      error
-    );
-  }
-}
-
-async function syncDriverTripToRTDB(
-  driverId,
-  orderId,
-  orderData
-) {
-
-  try {
-
-    await rtdb
-      .ref(
-        `active_driver_trips/${driverId}/${orderId}`
-      )
-      .set({
-
-        orderId,
-
-        driverId,
-
-        status:
-          orderData.status || "",
-
-        driverStatus:
-          orderData.driverStatus || "",
-
-        workflowType:
-          orderData.workflowType || "",
-
-        updatedAt:
-          Date.now(),
-
-        data:
-          orderData
-      });
-
-  } catch (error) {
-
-    console.log(
-      "syncDriverTripToRTDB error",
-      error
-    );
-  }
-}
-
-async function removeDriverTripFromRTDB(
+async function removeDriverRequest(
   driverId,
   orderId
 ) {
@@ -144,14 +75,52 @@ async function removeDriverTripFromRTDB(
 
     await rtdb
       .ref(
-        `active_driver_trips/${driverId}/${orderId}`
+        `driver_trip_requests/${driverId}/${orderId}`
       )
       .remove();
 
   } catch (error) {
 
     console.log(
-      "removeDriverTripFromRTDB error",
+      "removeDriverRequest error",
+      error
+    );
+  }
+}
+
+async function removeRequestFromAllDrivers(
+  orderId
+) {
+
+  try {
+
+    const requestSnap =
+      await rtdb
+        .ref(
+          "driver_trip_requests"
+        )
+        .once("value");
+
+    const requests =
+      requestSnap.val() || {};
+
+    for (
+      const uid of Object.keys(
+        requests
+      )
+    ) {
+
+      await rtdb
+        .ref(
+          `driver_trip_requests/${uid}/${orderId}`
+        )
+        .remove();
+    }
+
+  } catch (error) {
+
+    console.log(
+      "removeRequestFromAllDrivers error",
       error
     );
   }
@@ -1160,28 +1129,52 @@ async function dispatchOrder(
 
   try {
 
-    await db
-      .collection("orders")
-      .doc(orderId)
-      .update({
+    const workflowType =
+      val(
+        orderData.workflowType
+      );
 
-        driverStatus:
-          "searching",
+    /* =======================================================
+       DIRECT TRIP FLOW
+    ======================================================= */
+    if (
+      workflowType ===
+      "direct_trip"
+    ) {
 
-        dispatchStartedAt:
-          now()
-      });
+      await db
+        .collection("orders")
+        .doc(orderId)
+        .update({
 
-    await syncOrderToRTDB(
-      orderId,
-      {
+          driverStatus:
+            "searching",
 
-        ...orderData,
+          dispatchStartedAt:
+            now()
+        });
+    }
 
-        driverStatus:
-          "searching"
-      }
-    );
+    /* =======================================================
+       STORE DELIVERY FLOW
+    ======================================================= */
+    if (
+      workflowType ===
+      "store_delivery"
+    ) {
+
+      await db
+        .collection("orders")
+        .doc(orderId)
+        .update({
+
+          driverStatus:
+            "searching",
+
+          dispatchStartedAt:
+            now()
+        });
+    }
 
     const matchedDriver =
       await findMatchingDriver(
@@ -1201,17 +1194,6 @@ async function dispatchOrder(
             "no_driver_found"
         });
 
-      await syncOrderToRTDB(
-        orderId,
-        {
-
-          ...orderData,
-
-          driverStatus:
-            "no_driver_found"
-        }
-      );
-
       return;
     }
 
@@ -1221,31 +1203,20 @@ async function dispatchOrder(
       .update({
 
         driverId:
-          matchedDriver.uid,
-
-        driverStatus:
-          "sent_to_driver"
+          matchedDriver.uid
       });
-
-    await syncOrderToRTDB(
-      orderId,
-      {
-
-        ...orderData,
-
-        driverId:
-          matchedDriver.uid,
-
-        driverStatus:
-          "sent_to_driver"
-      }
-    );
 
     await sendRequestToDriver(
 
       orderId,
 
-      orderData,
+      {
+
+        ...orderData,
+
+        driverStatus:
+          "searching"
+      },
 
       matchedDriver.uid
     );
@@ -1315,68 +1286,56 @@ app.post(
       const orderData =
         orderDoc.data() || {};
 
+      const workflowType =
+        val(
+          orderData.workflowType
+        );
+
+      /* =======================================================
+         DIRECT TRIP ACCEPT FLOW
+      ======================================================= */
       if (
-
-        orderData.driverStatus ===
-        "accepted"
-
+        workflowType ===
+        "direct_trip"
       ) {
 
-        return res.json({
+        await orderRef.update({
 
-          success: false,
+          driverId,
 
-          message:
-            "Trip already accepted"
+          status:
+            "accepted",
+
+          driverStatus:
+            "accepted",
+
+          acceptedAt:
+            now()
         });
       }
 
-      await orderRef.update({
+      /* =======================================================
+         STORE DELIVERY ACCEPT FLOW
+      ======================================================= */
+      if (
+        workflowType ===
+        "store_delivery"
+      ) {
 
-        driverId,
-
-        driverStatus:
-          "accepted",
-
-        status:
-          "driver_assigned",
-
-        acceptedAt:
-          now()
-      });
-
-      await syncOrderToRTDB(
-        orderId,
-        {
-
-          ...orderData,
+        await orderRef.update({
 
           driverId,
 
-          driverStatus:
-            "accepted",
-
           status:
-            "driver_assigned"
-        }
-      );
-
-      await syncDriverTripToRTDB(
-        driverId,
-        orderId,
-        {
-
-          ...orderData,
-
-          driverId,
+            "assigned",
 
           driverStatus:
-            "accepted",
+            "driver_assigned",
 
-          status:
-            "driver_assigned"
-        }
-      );
+          acceptedAt:
+            now()
+        });
+      }
 
       await rtdb
         .ref(
@@ -1392,6 +1351,12 @@ app.post(
           currentRequest:
             null
         });
+
+      /* =======================================================
+         IMPORTANT:
+         DO NOT DELETE ACCEPTED DRIVER REQUEST
+         ONLY REMOVE FROM OTHER DRIVERS
+      ======================================================= */
 
       const requestSnap =
         await rtdb
@@ -1409,11 +1374,16 @@ app.post(
         )
       ) {
 
-        await rtdb
-          .ref(
-            `driver_trip_requests/${uid}/${orderId}`
-          )
-          .remove();
+        if (
+          uid !== driverId
+        ) {
+
+          await rtdb
+            .ref(
+              `driver_trip_requests/${uid}/${orderId}`
+            )
+            .remove();
+        }
       }
 
       return res.json({
@@ -1466,33 +1436,245 @@ app.post(
           });
       }
 
+      await removeDriverRequest(
+        driverId,
+        orderId
+      );
+
       await rtdb
         .ref(
-          `driver_trip_requests/${driverId}/${orderId}`
+          `drivers_online/${driverId}`
         )
-        .remove();
+        .update({
+
+          currentRequest:
+            null
+        });
+
+      return res.json({
+
+        success: true
+      });
+
+    } catch (error) {
+
+      return res
+        .status(500)
+        .json({
+
+          error:
+            error.message
+        });
+    }
+  }
+);
+
+/* =======================================================
+   🔥 DRIVER ARRIVED
+======================================================= */
+app.post(
+  "/arrivedAtPickup",
+  async (req, res) => {
+
+    try {
+
+      const body =
+        req.body || {};
+
+      const orderId =
+        val(body.orderId);
 
       await db
         .collection("orders")
         .doc(orderId)
         .update({
 
-          driverStatus:
-            "waiting",
+          status:
+            "arrived",
 
-          driverId: null
+          updatedAt:
+            now()
         });
 
-      await syncOrderToRTDB(
-        orderId,
-        {
+      return res.json({
 
-          driverStatus:
-            "waiting",
+        success: true
+      });
 
-          driverId: null
-        }
-      );
+    } catch (error) {
+
+      return res
+        .status(500)
+        .json({
+
+          error:
+            error.message
+        });
+    }
+  }
+);
+
+/* =======================================================
+   🔥 START DIRECT TRIP
+======================================================= */
+app.post(
+  "/startTrip",
+  async (req, res) => {
+
+    try {
+
+      const body =
+        req.body || {};
+
+      const orderId =
+        val(body.orderId);
+
+      await db
+        .collection("orders")
+        .doc(orderId)
+        .update({
+
+          status:
+            "started",
+
+          updatedAt:
+            now()
+        });
+
+      return res.json({
+
+        success: true
+      });
+
+    } catch (error) {
+
+      return res
+        .status(500)
+        .json({
+
+          error:
+            error.message
+        });
+    }
+  }
+);
+
+/* =======================================================
+   🔥 DRIVER AT STORE
+======================================================= */
+app.post(
+  "/driverAtStore",
+  async (req, res) => {
+
+    try {
+
+      const body =
+        req.body || {};
+
+      const orderId =
+        val(body.orderId);
+
+      await db
+        .collection("orders")
+        .doc(orderId)
+        .update({
+
+          status:
+            "at_store",
+
+          updatedAt:
+            now()
+        });
+
+      return res.json({
+
+        success: true
+      });
+
+    } catch (error) {
+
+      return res
+        .status(500)
+        .json({
+
+          error:
+            error.message
+        });
+    }
+  }
+);
+
+/* =======================================================
+   🔥 PICKED UP
+======================================================= */
+app.post(
+  "/pickedUpOrder",
+  async (req, res) => {
+
+    try {
+
+      const body =
+        req.body || {};
+
+      const orderId =
+        val(body.orderId);
+
+      await db
+        .collection("orders")
+        .doc(orderId)
+        .update({
+
+          status:
+            "picked_up",
+
+          updatedAt:
+            now()
+        });
+
+      return res.json({
+
+        success: true
+      });
+
+    } catch (error) {
+
+      return res
+        .status(500)
+        .json({
+
+          error:
+            error.message
+        });
+    }
+  }
+);
+
+/* =======================================================
+   🔥 DELIVERED
+======================================================= */
+app.post(
+  "/deliveredOrder",
+  async (req, res) => {
+
+    try {
+
+      const body =
+        req.body || {};
+
+      const orderId =
+        val(body.orderId);
+
+      await db
+        .collection("orders")
+        .doc(orderId)
+        .update({
+
+          status:
+            "delivered",
+
+          updatedAt:
+            now()
+        });
 
       return res.json({
 
@@ -1559,20 +1741,7 @@ app.post(
             now()
         });
 
-      await syncOrderToRTDB(
-        orderId,
-        {
-
-          status:
-            "completed",
-
-          driverStatus:
-            "completed"
-        }
-      );
-
-      await removeDriverTripFromRTDB(
-        driverId,
+      await removeRequestFromAllDrivers(
         orderId
       );
 
@@ -1584,7 +1753,9 @@ app.post(
 
           isBusy: false,
 
-          currentTrip: null
+          currentTrip: null,
+
+          currentRequest: null
         });
 
       return res.json({
@@ -1638,26 +1809,13 @@ app.post(
             now()
         });
 
-      await syncOrderToRTDB(
-        orderId,
-        {
-
-          status:
-            "cancelled",
-
-          driverStatus:
-            "cancelled"
-        }
+      await removeRequestFromAllDrivers(
+        orderId
       );
 
       if (
         driverId
       ) {
-
-        await removeDriverTripFromRTDB(
-          driverId,
-          orderId
-        );
 
         await rtdb
           .ref(
@@ -1667,7 +1825,9 @@ app.post(
 
             isBusy: false,
 
-            currentTrip: null
+            currentTrip: null,
+
+            currentRequest: null
           });
       }
 
@@ -1725,11 +1885,9 @@ db.collection("orders")
             data.driverStatus
           );
 
-        await syncOrderToRTDB(
-          orderId,
-          data
-        );
-
+        /* =======================================================
+           STORE DELIVERY FLOW
+        ======================================================= */
         if (
 
           (
@@ -1740,64 +1898,64 @@ db.collection("orders")
             "modified"
           ) &&
 
+          workflowType ===
+            "store_delivery" &&
+
+          status ===
+            "ready_for_pickup" &&
+
           driverStatus ===
             "waiting"
 
         ) {
 
-          if (
+          console.log(
+            "Starting store delivery dispatch"
+          );
 
-            workflowType ===
-            "store_delivery" &&
-
-            status ===
-            "ready_for_pickup"
-
-          ) {
-
-            console.log(
-              "Starting store dispatch"
-            );
-
-            await dispatchOrder(
-              orderId,
-              data
-            );
-          }
-
-          if (
-
-            workflowType ===
-            "direct_trip" &&
-
-            status ===
-            "pending"
-
-          ) {
-
-            console.log(
-              "Starting direct trip dispatch"
-            );
-
-            await dispatchOrder(
-              orderId,
-              data
-            );
-          }
-        }
-
-        if (
-          driverStatus ===
-          "accepted"
-        ) {
-
-          await syncDriverTripToRTDB(
-            data.driverId,
+          await dispatchOrder(
             orderId,
             data
           );
         }
 
+        /* =======================================================
+           DIRECT TRIP FLOW
+        ======================================================= */
+        if (
+
+          (
+            change.type ===
+            "added" ||
+
+            change.type ===
+            "modified"
+          ) &&
+
+          workflowType ===
+            "direct_trip" &&
+
+          status ===
+            "pending" &&
+
+          driverStatus ===
+            "waiting"
+
+        ) {
+
+          console.log(
+            "Starting direct trip dispatch"
+          );
+
+          await dispatchOrder(
+            orderId,
+            data
+          );
+        }
+
+        /* =======================================================
+           COMPLETED / CANCELLED
+        ======================================================= */
         if (
 
           status ===
@@ -1812,11 +1970,6 @@ db.collection("orders")
             data.driverId
           ) {
 
-            await removeDriverTripFromRTDB(
-              data.driverId,
-              orderId
-            );
-
             await rtdb
               .ref(
                 `drivers_online/${data.driverId}`
@@ -1826,9 +1979,16 @@ db.collection("orders")
                 isBusy: false,
 
                 currentTrip:
+                  null,
+
+                currentRequest:
                   null
               });
           }
+
+          await removeRequestFromAllDrivers(
+            orderId
+          );
         }
       }
     }
@@ -2074,6 +2234,39 @@ app.post(
 
       const cards = [];
 
+      const DISPLAY_NAMES = {
+
+        delivery_car:
+          "Car",
+
+        delivery_motorbike:
+          "Motorbike",
+
+        delivery_bicycle:
+          "Bicycle",
+
+        open_truck:
+          "Open Truck",
+
+        closed_truck:
+          "Closed Truck",
+
+        economy:
+          "Economy",
+
+        comfort:
+          "Comfort",
+
+        premium:
+          "Premium",
+
+        xl:
+          "XL",
+
+        xxl:
+          "XXL"
+      };
+
       for (
         const category of categories
       ) {
@@ -2099,7 +2292,9 @@ app.post(
             category,
 
             title:
-              category,
+              DISPLAY_NAMES[
+                category
+              ] || category,
 
             enabled:
               false,
@@ -2178,7 +2373,9 @@ app.post(
           category,
 
           title:
-            category,
+            DISPLAY_NAMES[
+              category
+            ] || category,
 
           dispatchService:
             pricingKey,
