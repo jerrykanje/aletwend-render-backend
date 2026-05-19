@@ -62,6 +62,9 @@ async function updateDriverRequestStatus(
       )
       .update({
 
+        /* IMPORTANT:
+           DRIVER APP LISTENS TO THIS status FIELD
+        */
         status,
 
         updatedAt:
@@ -1289,7 +1292,6 @@ async function dispatchOrder(
       orderId,
 
       {
-
         ...orderData,
 
         driverStatus:
@@ -1551,7 +1553,7 @@ app.post(
 );
 
 /* =======================================================
-   🔥 UNIVERSAL TRIP STATUS UPDATE
+   🔥 UNIVERSAL UPDATE TRIP STATUS
 ======================================================= */
 app.post(
   "/updateTripStatus",
@@ -1582,15 +1584,67 @@ app.post(
           });
       }
 
-      const driverId =
-        await getOrderDriverId(
-          orderId
-        );
+      const allowedStatuses = [
+
+        "arrived",
+
+        "started",
+
+        "completed",
+
+        "at_store",
+
+        "picked_up",
+
+        "delivered",
+
+        "cancelled"
+      ];
+
+      if (
+        !allowedStatuses.includes(
+          status
+        )
+      ) {
+
+        return res
+          .status(400)
+          .json({
+
+            error:
+              "Invalid status"
+          });
+      }
 
       const orderRef =
         db
           .collection("orders")
           .doc(orderId);
+
+      const orderDoc =
+        await orderRef.get();
+
+      if (
+        !orderDoc.exists
+      ) {
+
+        return res
+          .status(404)
+          .json({
+
+            error:
+              "Order not found"
+          });
+      }
+
+      const orderData =
+        orderDoc.data() || {};
+
+      const driverId =
+        orderData.driverId ||
+        await getOrderDriverId(
+          orderId
+        );
 
       const updateData = {
 
@@ -1602,54 +1656,6 @@ app.post(
         updatedAt:
           now()
       };
-
-      /* =======================================================
-         STATUS TIMESTAMPS
-      ======================================================= */
-      if (
-        status ===
-        "arrived"
-      ) {
-
-        updateData.arrivedAt =
-          now();
-      }
-
-      if (
-        status ===
-        "started"
-      ) {
-
-        updateData.startedAt =
-          now();
-      }
-
-      if (
-        status ===
-        "at_store"
-      ) {
-
-        updateData.atStoreAt =
-          now();
-      }
-
-      if (
-        status ===
-        "picked_up"
-      ) {
-
-        updateData.pickedUpAt =
-          now();
-      }
-
-      if (
-        status ===
-        "delivered"
-      ) {
-
-        updateData.deliveredAt =
-          now();
-      }
 
       if (
         status ===
@@ -1683,7 +1689,7 @@ app.post(
       );
 
       /* =======================================================
-         COMPLETE / CANCEL CLEANUP
+         RELEASE DRIVER AFTER COMPLETE/CANCEL
       ======================================================= */
       if (
 
@@ -1711,11 +1717,9 @@ app.post(
 
               isBusy: false,
 
-              currentTrip:
-                null,
+              currentTrip: null,
 
-              currentRequest:
-                null
+              currentRequest: null
             });
         }
       }
@@ -1724,206 +1728,6 @@ app.post(
 
         success: true
       });
-
-    } catch (error) {
-
-      return res
-        .status(500)
-        .json({
-
-          error:
-            error.message
-        });
-    }
-  }
-);
-
-/* =======================================================
-   🔥 LEGACY ROUTES
-   FOR OLD DRIVER APP COMPATIBILITY
-======================================================= */
-app.post(
-  "/arrivedAtPickup",
-  async (req, res) => {
-
-    try {
-
-      req.body.status =
-        "arrived";
-
-      return app._router.handle(
-        req,
-        res,
-        () => {}
-      );
-
-    } catch (error) {
-
-      return res
-        .status(500)
-        .json({
-
-          error:
-            error.message
-        });
-    }
-  }
-);
-
-app.post(
-  "/startTrip",
-  async (req, res) => {
-
-    try {
-
-      req.body.status =
-        "started";
-
-      return app._router.handle(
-        req,
-        res,
-        () => {}
-      );
-
-    } catch (error) {
-
-      return res
-        .status(500)
-        .json({
-
-          error:
-            error.message
-        });
-    }
-  }
-);
-
-app.post(
-  "/driverAtStore",
-  async (req, res) => {
-
-    try {
-
-      req.body.status =
-        "at_store";
-
-      return app._router.handle(
-        req,
-        res,
-        () => {}
-      );
-
-    } catch (error) {
-
-      return res
-        .status(500)
-        .json({
-
-          error:
-            error.message
-        });
-    }
-  }
-);
-
-app.post(
-  "/pickedUpOrder",
-  async (req, res) => {
-
-    try {
-
-      req.body.status =
-        "picked_up";
-
-      return app._router.handle(
-        req,
-        res,
-        () => {}
-      );
-
-    } catch (error) {
-
-      return res
-        .status(500)
-        .json({
-
-          error:
-            error.message
-        });
-    }
-  }
-);
-
-app.post(
-  "/deliveredOrder",
-  async (req, res) => {
-
-    try {
-
-      req.body.status =
-        "delivered";
-
-      return app._router.handle(
-        req,
-        res,
-        () => {}
-      );
-
-    } catch (error) {
-
-      return res
-        .status(500)
-        .json({
-
-          error:
-            error.message
-        });
-    }
-  }
-);
-
-app.post(
-  "/completeTrip",
-  async (req, res) => {
-
-    try {
-
-      req.body.status =
-        "completed";
-
-      return app._router.handle(
-        req,
-        res,
-        () => {}
-      );
-
-    } catch (error) {
-
-      return res
-        .status(500)
-        .json({
-
-          error:
-            error.message
-        });
-    }
-  }
-);
-
-app.post(
-  "/cancelTrip",
-  async (req, res) => {
-
-    try {
-
-      req.body.status =
-        "cancelled";
-
-      return app._router.handle(
-        req,
-        res,
-        () => {}
-      );
 
     } catch (error) {
 
