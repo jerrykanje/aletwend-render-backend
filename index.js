@@ -62,9 +62,6 @@ async function updateDriverRequestStatus(
       )
       .update({
 
-        /* IMPORTANT:
-           DRIVER APP LISTENS TO THIS status FIELD
-        */
         status,
 
         updatedAt:
@@ -1161,9 +1158,6 @@ async function sendRequestToDriver(
       requestType:
         workflowType,
 
-      /* IMPORTANT:
-         THIS IS THE STATUS DRIVER APP LISTENS TO
-      */
       status:
         "incoming_request",
 
@@ -1375,11 +1369,6 @@ app.post(
           orderData.workflowType
         );
 
-      /* IMPORTANT FIX:
-         UPDATE BOTH FIRESTORE STATUS
-         AND RTDB REQUEST STATUS
-      */
-
       if (
         workflowType ===
         "direct_trip"
@@ -1426,9 +1415,6 @@ app.post(
         });
       }
 
-      /* IMPORTANT:
-         DRIVER APP LISTENS TO THIS
-      */
       await updateDriverRequestStatus(
 
         driverId,
@@ -1565,10 +1551,10 @@ app.post(
 );
 
 /* =======================================================
-   🔥 DRIVER ARRIVED
+   🔥 UNIVERSAL TRIP STATUS UPDATE
 ======================================================= */
 app.post(
-  "/arrivedAtPickup",
+  "/updateTripStatus",
   async (req, res) => {
 
     try {
@@ -1579,325 +1565,12 @@ app.post(
       const orderId =
         val(body.orderId);
 
-      const driverId =
-        await getOrderDriverId(
-          orderId
-        );
-
-      await db
-        .collection("orders")
-        .doc(orderId)
-        .update({
-
-          status:
-            "arrived",
-
-          driverStatus:
-            "arrived",
-
-          updatedAt:
-            now()
-        });
-
-      /* IMPORTANT:
-         UPDATE RTDB STATUS DRIVER APP USES
-      */
-      await updateDriverRequestStatus(
-
-        driverId,
-
-        orderId,
-
-        "arrived"
-      );
-
-      return res.json({
-
-        success: true
-      });
-
-    } catch (error) {
-
-      return res
-        .status(500)
-        .json({
-
-          error:
-            error.message
-        });
-    }
-  }
-);
-
-/* =======================================================
-   🔥 START DIRECT TRIP
-======================================================= */
-app.post(
-  "/startTrip",
-  async (req, res) => {
-
-    try {
-
-      const body =
-        req.body || {};
-
-      const orderId =
-        val(body.orderId);
-
-      const driverId =
-        await getOrderDriverId(
-          orderId
-        );
-
-      await db
-        .collection("orders")
-        .doc(orderId)
-        .update({
-
-          status:
-            "started",
-
-          driverStatus:
-            "started",
-
-          updatedAt:
-            now()
-        });
-
-      await updateDriverRequestStatus(
-
-        driverId,
-
-        orderId,
-
-        "started"
-      );
-
-      return res.json({
-
-        success: true
-      });
-
-    } catch (error) {
-
-      return res
-        .status(500)
-        .json({
-
-          error:
-            error.message
-        });
-    }
-  }
-);
-
-/* =======================================================
-   🔥 DRIVER AT STORE
-======================================================= */
-app.post(
-  "/driverAtStore",
-  async (req, res) => {
-
-    try {
-
-      const body =
-        req.body || {};
-
-      const orderId =
-        val(body.orderId);
-
-      const driverId =
-        await getOrderDriverId(
-          orderId
-        );
-
-      await db
-        .collection("orders")
-        .doc(orderId)
-        .update({
-
-          status:
-            "at_store",
-
-          driverStatus:
-            "at_store",
-
-          updatedAt:
-            now()
-        });
-
-      await updateDriverRequestStatus(
-
-        driverId,
-
-        orderId,
-
-        "at_store"
-      );
-
-      return res.json({
-
-        success: true
-      });
-
-    } catch (error) {
-
-      return res
-        .status(500)
-        .json({
-
-          error:
-            error.message
-        });
-    }
-  }
-);
-
-/* =======================================================
-   🔥 PICKED UP
-======================================================= */
-app.post(
-  "/pickedUpOrder",
-  async (req, res) => {
-
-    try {
-
-      const body =
-        req.body || {};
-
-      const orderId =
-        val(body.orderId);
-
-      const driverId =
-        await getOrderDriverId(
-          orderId
-        );
-
-      await db
-        .collection("orders")
-        .doc(orderId)
-        .update({
-
-          status:
-            "picked_up",
-
-          driverStatus:
-            "picked_up",
-
-          updatedAt:
-            now()
-        });
-
-      await updateDriverRequestStatus(
-
-        driverId,
-
-        orderId,
-
-        "picked_up"
-      );
-
-      return res.json({
-
-        success: true
-      });
-
-    } catch (error) {
-
-      return res
-        .status(500)
-        .json({
-
-          error:
-            error.message
-        });
-    }
-  }
-);
-
-/* =======================================================
-   🔥 DELIVERED
-======================================================= */
-app.post(
-  "/deliveredOrder",
-  async (req, res) => {
-
-    try {
-
-      const body =
-        req.body || {};
-
-      const orderId =
-        val(body.orderId);
-
-      const driverId =
-        await getOrderDriverId(
-          orderId
-        );
-
-      await db
-        .collection("orders")
-        .doc(orderId)
-        .update({
-
-          status:
-            "delivered",
-
-          driverStatus:
-            "delivered",
-
-          updatedAt:
-            now()
-        });
-
-      await updateDriverRequestStatus(
-
-        driverId,
-
-        orderId,
-
-        "delivered"
-      );
-
-      return res.json({
-
-        success: true
-      });
-
-    } catch (error) {
-
-      return res
-        .status(500)
-        .json({
-
-          error:
-            error.message
-        });
-    }
-  }
-);
-
-/* =======================================================
-   🔥 COMPLETE TRIP
-======================================================= */
-app.post(
-  "/completeTrip",
-  async (req, res) => {
-
-    try {
-
-      const body =
-        req.body || {};
-
-      const orderId =
-        val(body.orderId);
-
-      const driverId =
-        val(body.driverId);
+      const status =
+        val(body.status);
 
       if (
         !orderId ||
-        !driverId
+        !status
       ) {
 
         return res
@@ -1905,24 +1578,100 @@ app.post(
           .json({
 
             error:
-              "Missing orderId or driverId"
+              "Missing orderId or status"
           });
       }
 
-      await db
-        .collection("orders")
-        .doc(orderId)
-        .update({
+      const driverId =
+        await getOrderDriverId(
+          orderId
+        );
 
-          status:
-            "completed",
+      const orderRef =
+        db
+          .collection("orders")
+          .doc(orderId);
 
-          driverStatus:
-            "completed",
+      const updateData = {
 
-          completedAt:
-            now()
-        });
+        status,
+
+        driverStatus:
+          status,
+
+        updatedAt:
+          now()
+      };
+
+      /* =======================================================
+         STATUS TIMESTAMPS
+      ======================================================= */
+      if (
+        status ===
+        "arrived"
+      ) {
+
+        updateData.arrivedAt =
+          now();
+      }
+
+      if (
+        status ===
+        "started"
+      ) {
+
+        updateData.startedAt =
+          now();
+      }
+
+      if (
+        status ===
+        "at_store"
+      ) {
+
+        updateData.atStoreAt =
+          now();
+      }
+
+      if (
+        status ===
+        "picked_up"
+      ) {
+
+        updateData.pickedUpAt =
+          now();
+      }
+
+      if (
+        status ===
+        "delivered"
+      ) {
+
+        updateData.deliveredAt =
+          now();
+      }
+
+      if (
+        status ===
+        "completed"
+      ) {
+
+        updateData.completedAt =
+          now();
+      }
+
+      if (
+        status ===
+        "cancelled"
+      ) {
+
+        updateData.cancelledAt =
+          now();
+      }
+
+      await orderRef.update(
+        updateData
+      );
 
       await updateDriverRequestStatus(
 
@@ -1930,25 +1679,46 @@ app.post(
 
         orderId,
 
-        "completed"
+        status
       );
 
-      await removeRequestFromAllDrivers(
-        orderId
-      );
+      /* =======================================================
+         COMPLETE / CANCEL CLEANUP
+      ======================================================= */
+      if (
 
-      await rtdb
-        .ref(
-          `drivers_online/${driverId}`
-        )
-        .update({
+        status ===
+          "completed" ||
 
-          isBusy: false,
+        status ===
+          "cancelled"
 
-          currentTrip: null,
+      ) {
 
-          currentRequest: null
-        });
+        await removeRequestFromAllDrivers(
+          orderId
+        );
+
+        if (
+          driverId
+        ) {
+
+          await rtdb
+            .ref(
+              `drivers_online/${driverId}`
+            )
+            .update({
+
+              isBusy: false,
+
+              currentTrip:
+                null,
+
+              currentRequest:
+                null
+            });
+        }
+      }
 
       return res.json({
 
@@ -1969,83 +1739,191 @@ app.post(
 );
 
 /* =======================================================
-   🔥 CANCEL TRIP
+   🔥 LEGACY ROUTES
+   FOR OLD DRIVER APP COMPATIBILITY
 ======================================================= */
+app.post(
+  "/arrivedAtPickup",
+  async (req, res) => {
+
+    try {
+
+      req.body.status =
+        "arrived";
+
+      return app._router.handle(
+        req,
+        res,
+        () => {}
+      );
+
+    } catch (error) {
+
+      return res
+        .status(500)
+        .json({
+
+          error:
+            error.message
+        });
+    }
+  }
+);
+
+app.post(
+  "/startTrip",
+  async (req, res) => {
+
+    try {
+
+      req.body.status =
+        "started";
+
+      return app._router.handle(
+        req,
+        res,
+        () => {}
+      );
+
+    } catch (error) {
+
+      return res
+        .status(500)
+        .json({
+
+          error:
+            error.message
+        });
+    }
+  }
+);
+
+app.post(
+  "/driverAtStore",
+  async (req, res) => {
+
+    try {
+
+      req.body.status =
+        "at_store";
+
+      return app._router.handle(
+        req,
+        res,
+        () => {}
+      );
+
+    } catch (error) {
+
+      return res
+        .status(500)
+        .json({
+
+          error:
+            error.message
+        });
+    }
+  }
+);
+
+app.post(
+  "/pickedUpOrder",
+  async (req, res) => {
+
+    try {
+
+      req.body.status =
+        "picked_up";
+
+      return app._router.handle(
+        req,
+        res,
+        () => {}
+      );
+
+    } catch (error) {
+
+      return res
+        .status(500)
+        .json({
+
+          error:
+            error.message
+        });
+    }
+  }
+);
+
+app.post(
+  "/deliveredOrder",
+  async (req, res) => {
+
+    try {
+
+      req.body.status =
+        "delivered";
+
+      return app._router.handle(
+        req,
+        res,
+        () => {}
+      );
+
+    } catch (error) {
+
+      return res
+        .status(500)
+        .json({
+
+          error:
+            error.message
+        });
+    }
+  }
+);
+
+app.post(
+  "/completeTrip",
+  async (req, res) => {
+
+    try {
+
+      req.body.status =
+        "completed";
+
+      return app._router.handle(
+        req,
+        res,
+        () => {}
+      );
+
+    } catch (error) {
+
+      return res
+        .status(500)
+        .json({
+
+          error:
+            error.message
+        });
+    }
+  }
+);
+
 app.post(
   "/cancelTrip",
   async (req, res) => {
 
     try {
 
-      const body =
-        req.body || {};
+      req.body.status =
+        "cancelled";
 
-      const orderId =
-        val(body.orderId);
-
-      let driverId =
-        val(body.driverId);
-
-      if (
-        !driverId
-      ) {
-
-        driverId =
-          await getOrderDriverId(
-            orderId
-          );
-      }
-
-      await db
-        .collection("orders")
-        .doc(orderId)
-        .update({
-
-          status:
-            "cancelled",
-
-          driverStatus:
-            "cancelled",
-
-          cancelledAt:
-            now()
-        });
-
-      await updateDriverRequestStatus(
-
-        driverId,
-
-        orderId,
-
-        "cancelled"
+      return app._router.handle(
+        req,
+        res,
+        () => {}
       );
-
-      await removeRequestFromAllDrivers(
-        orderId
-      );
-
-      if (
-        driverId
-      ) {
-
-        await rtdb
-          .ref(
-            `drivers_online/${driverId}`
-          )
-          .update({
-
-            isBusy: false,
-
-            currentTrip: null,
-
-            currentRequest: null
-          });
-      }
-
-      return res.json({
-
-        success: true
-      });
 
     } catch (error) {
 
