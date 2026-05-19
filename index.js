@@ -62,6 +62,9 @@ async function updateDriverRequestStatus(
       )
       .update({
 
+        /* IMPORTANT:
+           DRIVER APP LISTENS TO THIS status FIELD
+        */
         status,
 
         updatedAt:
@@ -1158,6 +1161,9 @@ async function sendRequestToDriver(
       requestType:
         workflowType,
 
+      /* IMPORTANT:
+         THIS IS THE STATUS DRIVER APP LISTENS TO
+      */
       status:
         "incoming_request",
 
@@ -1369,6 +1375,11 @@ app.post(
           orderData.workflowType
         );
 
+      /* IMPORTANT FIX:
+         UPDATE BOTH FIRESTORE STATUS
+         AND RTDB REQUEST STATUS
+      */
+
       if (
         workflowType ===
         "direct_trip"
@@ -1382,9 +1393,12 @@ app.post(
             "accepted",
 
           driverStatus:
-            "accepted",
+            "assigned",
 
           acceptedAt:
+            now(),
+
+          updatedAt:
             now()
         });
       }
@@ -1402,13 +1416,19 @@ app.post(
             "assigned",
 
           driverStatus:
-            "driver_assigned",
+            "assigned",
 
           acceptedAt:
+            now(),
+
+          updatedAt:
             now()
         });
       }
 
+      /* IMPORTANT:
+         DRIVER APP LISTENS TO THIS
+      */
       await updateDriverRequestStatus(
 
         driverId,
@@ -1572,69 +1592,16 @@ app.post(
           status:
             "arrived",
 
-          updatedAt:
-            now()
-        });
-
-      await updateDriverRequestStatus(
-
-        driverId,
-
-        orderId,
-
-        "arrived"
-      );
-
-      return res.json({
-
-        success: true
-      });
-
-    } catch (error) {
-
-      return res
-        .status(500)
-        .json({
-
-          error:
-            error.message
-        });
-    }
-  }
-);
-
-/* =======================================================
-   🔥 DRIVER ARRIVED (ALIAS)
-======================================================= */
-app.post(
-  "/driverArrived",
-  async (req, res) => {
-
-    try {
-
-      const body =
-        req.body || {};
-
-      const orderId =
-        val(body.orderId);
-
-      const driverId =
-        await getOrderDriverId(
-          orderId
-        );
-
-      await db
-        .collection("orders")
-        .doc(orderId)
-        .update({
-
-          status:
+          driverStatus:
             "arrived",
 
           updatedAt:
             now()
         });
 
+      /* IMPORTANT:
+         UPDATE RTDB STATUS DRIVER APP USES
+      */
       await updateDriverRequestStatus(
 
         driverId,
@@ -1688,6 +1655,9 @@ app.post(
         .update({
 
           status:
+            "started",
+
+          driverStatus:
             "started",
 
           updatedAt:
@@ -1749,6 +1719,9 @@ app.post(
           status:
             "at_store",
 
+          driverStatus:
+            "at_store",
+
           updatedAt:
             now()
         });
@@ -1808,6 +1781,9 @@ app.post(
           status:
             "picked_up",
 
+          driverStatus:
+            "picked_up",
+
           updatedAt:
             now()
         });
@@ -1865,6 +1841,9 @@ app.post(
         .update({
 
           status:
+            "delivered",
+
+          driverStatus:
             "delivered",
 
           updatedAt:
