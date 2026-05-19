@@ -38,6 +38,90 @@ const now = () =>
   admin.firestore.FieldValue.serverTimestamp();
 
 /* =======================================================
+   🔥 RTDB REQUEST STATUS SYNC
+======================================================= */
+async function updateDriverRequestStatus(
+  driverId,
+  orderId,
+  status,
+  extra = {}
+) {
+
+  try {
+
+    if (
+      !driverId ||
+      !orderId
+    ) {
+      return;
+    }
+
+    await rtdb
+      .ref(
+        `driver_trip_requests/${driverId}/${orderId}`
+      )
+      .update({
+
+        status,
+
+        updatedAt:
+          Date.now(),
+
+        ...extra
+      });
+
+  } catch (error) {
+
+    console.log(
+      "updateDriverRequestStatus error",
+      error
+    );
+  }
+}
+
+/* =======================================================
+   🔥 GET ORDER DRIVER ID
+======================================================= */
+async function getOrderDriverId(
+  orderId
+) {
+
+  try {
+
+    if (!orderId) {
+      return null;
+    }
+
+    const orderDoc =
+      await db
+        .collection("orders")
+        .doc(orderId)
+        .get();
+
+    if (
+      !orderDoc.exists
+    ) {
+
+      return null;
+    }
+
+    return (
+      orderDoc.data()
+        ?.driverId || null
+    );
+
+  } catch (error) {
+
+    console.log(
+      "getOrderDriverId error",
+      error
+    );
+
+    return null;
+  }
+}
+
+/* =======================================================
    🚚 MASTER TRUCK TABLE
 ======================================================= */
 const TRUCK_MASTER = {
@@ -1134,9 +1218,6 @@ async function dispatchOrder(
         orderData.workflowType
       );
 
-    /* =======================================================
-       DIRECT TRIP FLOW
-    ======================================================= */
     if (
       workflowType ===
       "direct_trip"
@@ -1155,9 +1236,6 @@ async function dispatchOrder(
         });
     }
 
-    /* =======================================================
-       STORE DELIVERY FLOW
-    ======================================================= */
     if (
       workflowType ===
       "store_delivery"
@@ -1291,9 +1369,6 @@ app.post(
           orderData.workflowType
         );
 
-      /* =======================================================
-         DIRECT TRIP ACCEPT FLOW
-      ======================================================= */
       if (
         workflowType ===
         "direct_trip"
@@ -1314,9 +1389,6 @@ app.post(
         });
       }
 
-      /* =======================================================
-         STORE DELIVERY ACCEPT FLOW
-      ======================================================= */
       if (
         workflowType ===
         "store_delivery"
@@ -1337,6 +1409,15 @@ app.post(
         });
       }
 
+      await updateDriverRequestStatus(
+
+        driverId,
+
+        orderId,
+
+        "accepted"
+      );
+
       await rtdb
         .ref(
           `drivers_online/${driverId}`
@@ -1351,12 +1432,6 @@ app.post(
           currentRequest:
             null
         });
-
-      /* =======================================================
-         IMPORTANT:
-         DO NOT DELETE ACCEPTED DRIVER REQUEST
-         ONLY REMOVE FROM OTHER DRIVERS
-      ======================================================= */
 
       const requestSnap =
         await rtdb
@@ -1484,6 +1559,11 @@ app.post(
       const orderId =
         val(body.orderId);
 
+      const driverId =
+        await getOrderDriverId(
+          orderId
+        );
+
       await db
         .collection("orders")
         .doc(orderId)
@@ -1495,6 +1575,74 @@ app.post(
           updatedAt:
             now()
         });
+
+      await updateDriverRequestStatus(
+
+        driverId,
+
+        orderId,
+
+        "arrived"
+      );
+
+      return res.json({
+
+        success: true
+      });
+
+    } catch (error) {
+
+      return res
+        .status(500)
+        .json({
+
+          error:
+            error.message
+        });
+    }
+  }
+);
+
+/* =======================================================
+   🔥 DRIVER ARRIVED (ALIAS)
+======================================================= */
+app.post(
+  "/driverArrived",
+  async (req, res) => {
+
+    try {
+
+      const body =
+        req.body || {};
+
+      const orderId =
+        val(body.orderId);
+
+      const driverId =
+        await getOrderDriverId(
+          orderId
+        );
+
+      await db
+        .collection("orders")
+        .doc(orderId)
+        .update({
+
+          status:
+            "arrived",
+
+          updatedAt:
+            now()
+        });
+
+      await updateDriverRequestStatus(
+
+        driverId,
+
+        orderId,
+
+        "arrived"
+      );
 
       return res.json({
 
@@ -1529,6 +1677,11 @@ app.post(
       const orderId =
         val(body.orderId);
 
+      const driverId =
+        await getOrderDriverId(
+          orderId
+        );
+
       await db
         .collection("orders")
         .doc(orderId)
@@ -1540,6 +1693,15 @@ app.post(
           updatedAt:
             now()
         });
+
+      await updateDriverRequestStatus(
+
+        driverId,
+
+        orderId,
+
+        "started"
+      );
 
       return res.json({
 
@@ -1574,6 +1736,11 @@ app.post(
       const orderId =
         val(body.orderId);
 
+      const driverId =
+        await getOrderDriverId(
+          orderId
+        );
+
       await db
         .collection("orders")
         .doc(orderId)
@@ -1585,6 +1752,15 @@ app.post(
           updatedAt:
             now()
         });
+
+      await updateDriverRequestStatus(
+
+        driverId,
+
+        orderId,
+
+        "at_store"
+      );
 
       return res.json({
 
@@ -1619,6 +1795,11 @@ app.post(
       const orderId =
         val(body.orderId);
 
+      const driverId =
+        await getOrderDriverId(
+          orderId
+        );
+
       await db
         .collection("orders")
         .doc(orderId)
@@ -1630,6 +1811,15 @@ app.post(
           updatedAt:
             now()
         });
+
+      await updateDriverRequestStatus(
+
+        driverId,
+
+        orderId,
+
+        "picked_up"
+      );
 
       return res.json({
 
@@ -1664,6 +1854,11 @@ app.post(
       const orderId =
         val(body.orderId);
 
+      const driverId =
+        await getOrderDriverId(
+          orderId
+        );
+
       await db
         .collection("orders")
         .doc(orderId)
@@ -1675,6 +1870,15 @@ app.post(
           updatedAt:
             now()
         });
+
+      await updateDriverRequestStatus(
+
+        driverId,
+
+        orderId,
+
+        "delivered"
+      );
 
       return res.json({
 
@@ -1741,6 +1945,15 @@ app.post(
             now()
         });
 
+      await updateDriverRequestStatus(
+
+        driverId,
+
+        orderId,
+
+        "completed"
+      );
+
       await removeRequestFromAllDrivers(
         orderId
       );
@@ -1791,8 +2004,18 @@ app.post(
       const orderId =
         val(body.orderId);
 
-      const driverId =
+      let driverId =
         val(body.driverId);
+
+      if (
+        !driverId
+      ) {
+
+        driverId =
+          await getOrderDriverId(
+            orderId
+          );
+      }
 
       await db
         .collection("orders")
@@ -1808,6 +2031,15 @@ app.post(
           cancelledAt:
             now()
         });
+
+      await updateDriverRequestStatus(
+
+        driverId,
+
+        orderId,
+
+        "cancelled"
+      );
 
       await removeRequestFromAllDrivers(
         orderId
@@ -1885,9 +2117,6 @@ db.collection("orders")
             data.driverStatus
           );
 
-        /* =======================================================
-           STORE DELIVERY FLOW
-        ======================================================= */
         if (
 
           (
@@ -1919,9 +2148,6 @@ db.collection("orders")
           );
         }
 
-        /* =======================================================
-           DIRECT TRIP FLOW
-        ======================================================= */
         if (
 
           (
@@ -1953,9 +2179,6 @@ db.collection("orders")
           );
         }
 
-        /* =======================================================
-           COMPLETED / CANCELLED
-        ======================================================= */
         if (
 
           status ===
@@ -2112,7 +2335,7 @@ app.post(
       if (
 
         serviceType ===
-        "delivery_truck"
+          "delivery_truck"
 
       ) {
 
