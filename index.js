@@ -1431,7 +1431,7 @@ app.post(
             driverId,
 
             status:
-              "assigned",
+              "driver_assigned",
 
             driverStatus:
               "assigned",
