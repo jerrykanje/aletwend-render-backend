@@ -74,14 +74,14 @@ async function buildDriverSnapshot(
       uid:
         driverId,
 
-      firstName:
-        driverData.firstName || "",
+      name:
+        driverData.name || "",
 
       phone:
         driverData.phone || "",
 
-      profilePicture:
-        driverData.profilePicture || "",
+      profileImage:
+        driverData.profileImage || "",
 
       rating:
         driverData.rating || 0,
