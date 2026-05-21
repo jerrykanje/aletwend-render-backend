@@ -38,6 +38,85 @@ const now = () =>
   admin.firestore.FieldValue.serverTimestamp();
 
 /* =======================================================
+   🔥 BUILD DRIVER SNAPSHOT
+   THIS IS THE NEW MODIFICATION
+======================================================= */
+async function buildDriverSnapshot(
+  driverId
+) {
+
+  try {
+
+    if (!driverId) {
+      return null;
+    }
+
+    const driverDoc =
+      await db
+        .collection("drivers")
+        .doc(driverId)
+        .get();
+
+    if (
+      !driverDoc.exists
+    ) {
+      return null;
+    }
+
+    const driverData =
+      driverDoc.data() || {};
+
+    const vehicle =
+      driverData.vehicle || {};
+
+    return {
+
+      uid:
+        driverId,
+
+      name:
+        driverData.name || "",
+
+      phone:
+        driverData.phone || "",
+
+      profileImage:
+        driverData.profileImage || "",
+
+      rating:
+        driverData.rating || 0,
+
+      vehicle: {
+
+        brand:
+          vehicle.brand || "",
+
+        model:
+          vehicle.model || "",
+
+        color:
+          vehicle.color || "",
+
+        plateNumber:
+          vehicle.plateNumber || "",
+
+        type:
+          vehicle.type || ""
+      }
+    };
+
+  } catch (error) {
+
+    console.log(
+      "buildDriverSnapshot error",
+      error
+    );
+
+    return null;
+  }
+}
+
+/* =======================================================
    🔥 RTDB REQUEST STATUS SYNC
 ======================================================= */
 async function updateDriverRequestStatus(
@@ -1386,10 +1465,16 @@ app.post(
 
       /* =======================================================
          🔥 ACCEPTED
+         🔥 DRIVER SNAPSHOT INJECTION
       ======================================================= */
       if (
         status === "accepted"
       ) {
+
+        const driverSnapshot =
+          await buildDriverSnapshot(
+            driverId
+          );
 
         if (
 
@@ -1401,6 +1486,9 @@ app.post(
           await orderRef.update({
 
             driverId,
+
+            driver:
+              driverSnapshot,
 
             status:
               "accepted",
@@ -1430,6 +1518,9 @@ app.post(
 
             driverId,
 
+            driver:
+              driverSnapshot,
+
             status:
               "driver_assigned",
 
@@ -1450,7 +1541,12 @@ app.post(
 
           orderId,
 
-          "accepted"
+          "accepted",
+
+          {
+            driver:
+              driverSnapshot
+          }
         );
 
         await rtdb
@@ -1498,7 +1594,10 @@ app.post(
 
         return res.json({
 
-          success: true
+          success: true,
+
+          driver:
+            driverSnapshot
         });
       }
 
