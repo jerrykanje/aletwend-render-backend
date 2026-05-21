@@ -38,81 +38,6 @@ const now = () =>
   admin.firestore.FieldValue.serverTimestamp();
 
 /* =======================================================
-   🔥 BUILD DRIVER SNAPSHOT
-======================================================= */
-async function buildDriverSnapshot(
-  driverId
-) {
-
-  try {
-
-    if (!driverId) {
-      return null;
-    }
-
-    const driverDoc =
-      await db
-        .collection("drivers")
-        .doc(driverId)
-        .get();
-
-    if (!driverDoc.exists) {
-      return null;
-    }
-
-    const driverData =
-      driverDoc.data() || {};
-
-    const vehicle =
-      driverData.vehicle || {};
-
-    return {
-
-      uid: driverId,
-
-      firstName:
-        driverData.firstName || "",
-
-      phone:
-        driverData.phone || "",
-
-      profilePicture:
-        driverData.profilePicture || "",
-
-      rating:
-        driverData.rating || 0,
-
-      vehicle: {
-
-        brand:
-          vehicle.brand || "",
-
-        model:
-          vehicle.model || "",
-
-        color:
-          vehicle.color || "",
-
-        plateNumber:
-          vehicle.plateNumber || "",
-
-        type:
-          vehicle.type || ""
-      }
-    };
-
-  } catch (error) {
-
-    console.log(
-      "buildDriverSnapshot error",
-      error
-    );
-
-    return null;
-  }
-}
-
-/* =======================================================
    🔥 RTDB REQUEST STATUS SYNC
 ======================================================= */
 async function updateDriverRequestStatus(
@@ -1331,6 +1256,7 @@ async function dispatchOrder(
 
 /* =======================================================
    🔥 CENTRALIZED UPDATE TRIP STATUS
+   FRONTEND SYNCED VERSION
 ======================================================= */
 app.post(
   "/updateTripStatus",
@@ -1465,14 +1391,85 @@ app.post(
         status === "accepted"
       ) {
 
-        /* =======================================================
-           🔥 BUILD DRIVER SNAPSHOT
-        ======================================================= */
-        const driverSnapshot =
-          await buildDriverSnapshot(
-            driverId
-          );
+        /* ---------------------------------------------------
+           📦 FETCH DRIVER SNAPSHOT FROM DRIVERS COLLECTION
+        --------------------------------------------------- */
+        let driverSnapshot = {};
 
+        try {
+
+          const driverDoc =
+            await db
+              .collection("drivers")
+              .doc(driverId)
+              .get();
+
+          if (
+            driverDoc.exists
+          ) {
+
+            const driverData =
+              driverDoc.data() || {};
+
+            const profile =
+              driverData.profile || {};
+
+            const vehicle =
+              driverData.vehicle || {};
+
+            driverSnapshot = {
+
+              firstName:
+                val(
+                  profile.firstName
+                ),
+
+              profilePicture:
+                val(
+                  profile.profilePicture
+                ),
+
+              rating:
+                driverData.rating ?? 0,
+
+              brand:
+                val(
+                  vehicle.brand
+                ),
+
+              carImage:
+                val(
+                  vehicle.carImage
+                ),
+
+              color:
+                val(
+                  vehicle.color
+                ),
+
+              model:
+                val(
+                  vehicle.model
+                ),
+
+              plateNumber:
+                val(
+                  vehicle.plateNumber
+                )
+            };
+          }
+
+        } catch (snapshotError) {
+
+          console.log(
+            "driverSnapshot fetch error",
+            snapshotError
+          );
+        }
+
+        /* ---------------------------------------------------
+           🚗 DIRECT TRIP — accept immediately
+        --------------------------------------------------- */
         if (
 
           workflowType ===
@@ -1484,9 +1481,6 @@ app.post(
 
             driverId,
 
-            driver:
-              driverSnapshot,
-
             status:
               "accepted",
 
@@ -1497,10 +1491,16 @@ app.post(
               now(),
 
             updatedAt:
-              now()
+              now(),
+
+            driverSnapshot
           });
         }
 
+        /* ---------------------------------------------------
+           🚚 STORE DELIVERY / DELIVERY — second accept
+           (driverStatus must already be "searching")
+        --------------------------------------------------- */
         if (
 
           workflowType ===
@@ -1515,9 +1515,6 @@ app.post(
 
             driverId,
 
-            driver:
-              driverSnapshot,
-
             status:
               "driver_assigned",
 
@@ -1528,7 +1525,9 @@ app.post(
               now(),
 
             updatedAt:
-              now()
+              now(),
+
+            driverSnapshot
           });
         }
 
@@ -1538,12 +1537,7 @@ app.post(
 
           orderId,
 
-          "accepted",
-
-          {
-            driver:
-              driverSnapshot
-          }
+          "accepted"
         );
 
         await rtdb
@@ -1591,10 +1585,7 @@ app.post(
 
         return res.json({
 
-          success: true,
-
-          driver:
-            driverSnapshot
+          success: true
         });
       }
 
