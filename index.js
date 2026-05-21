@@ -1,4 +1,5 @@
-const express = require("express");
+const express = require("express");  
+
 const cors = require("cors");
 const admin = require("firebase-admin");
 
@@ -1162,6 +1163,10 @@ async function sendRequestToDriver(
 
   try {
 
+    // ✅ ADDED: build driver snapshot so request doc stores name + profilePicture
+    const driverSnapshot =
+      await buildDriverSnapshot(driverUid);
+
     const workflowType =
       val(
         orderData.workflowType
@@ -1189,7 +1194,11 @@ async function sendRequestToDriver(
         Date.now() + 30000,
 
       data:
-        orderData
+        orderData,
+
+      // ✅ ADDED: driver info now stored inside request doc
+      driver:
+        driverSnapshot
     };
 
     await rtdb
@@ -1465,19 +1474,14 @@ app.post(
         status === "accepted"
       ) {
 
-        /* =======================================================
-           🔥 BUILD DRIVER SNAPSHOT
-        ======================================================= */
         const driverSnapshot =
           await buildDriverSnapshot(
             driverId
           );
 
         if (
-
           workflowType ===
           "direct_trip"
-
         ) {
 
           await orderRef.update({
@@ -1502,13 +1506,10 @@ app.post(
         }
 
         if (
-
           workflowType ===
             "store_delivery" ||
-
           workflowType ===
             "delivery"
-
         ) {
 
           await orderRef.update({
@@ -1533,13 +1534,9 @@ app.post(
         }
 
         await updateDriverRequestStatus(
-
           driverId,
-
           orderId,
-
           "accepted",
-
           {
             driver:
               driverSnapshot
@@ -1598,9 +1595,6 @@ app.post(
         });
       }
 
-      /* =======================================================
-         🔥 DRIVER VALIDATION
-      ======================================================= */
       if (
         orderData.driverId !==
         driverId
@@ -1615,210 +1609,113 @@ app.post(
           });
       }
 
-      /* =======================================================
-         🔥 ARRIVED
-      ======================================================= */
-      if (
-        status === "arrived"
-      ) {
+      if (status === "arrived") {
 
         await orderRef.update({
 
-          status:
-            "arrived",
-
-          driverStatus:
-            "arrived",
-
-          updatedAt:
-            now()
+          status: "arrived",
+          driverStatus: "arrived",
+          updatedAt: now()
         });
 
         await updateDriverRequestStatus(
-
           driverId,
-
           orderId,
-
           "arrived"
         );
 
-        return res.json({
-
-          success: true
-        });
+        return res.json({ success: true });
       }
 
-      /* =======================================================
-         🔥 STARTED
-      ======================================================= */
-      if (
-        status === "started"
-      ) {
+      if (status === "started") {
 
         await orderRef.update({
 
-          status:
-            "started",
-
-          driverStatus:
-            "started",
-
-          updatedAt:
-            now()
+          status: "started",
+          driverStatus: "started",
+          updatedAt: now()
         });
 
         await updateDriverRequestStatus(
-
           driverId,
-
           orderId,
-
           "started"
         );
 
-        return res.json({
-
-          success: true
-        });
+        return res.json({ success: true });
       }
 
-      /* =======================================================
-         🔥 AT STORE
-      ======================================================= */
-      if (
-        status === "at_store"
-      ) {
+      if (status === "at_store") {
 
         await orderRef.update({
 
-          status:
-            "at_store",
-
-          driverStatus:
-            "at_store",
-
-          updatedAt:
-            now()
+          status: "at_store",
+          driverStatus: "at_store",
+          updatedAt: now()
         });
 
         await updateDriverRequestStatus(
-
           driverId,
-
           orderId,
-
           "at_store"
         );
 
-        return res.json({
-
-          success: true
-        });
+        return res.json({ success: true });
       }
 
-      /* =======================================================
-         🔥 PICKED UP
-      ======================================================= */
-      if (
-        status === "picked_up"
-      ) {
+      if (status === "picked_up") {
 
         await orderRef.update({
 
-          status:
-            "picked_up",
-
-          driverStatus:
-            "picked_up",
-
-          updatedAt:
-            now()
+          status: "picked_up",
+          driverStatus: "picked_up",
+          updatedAt: now()
         });
 
         await updateDriverRequestStatus(
-
           driverId,
-
           orderId,
-
           "picked_up"
         );
 
-        return res.json({
-
-          success: true
-        });
+        return res.json({ success: true });
       }
 
-      /* =======================================================
-         🔥 DELIVERED
-      ======================================================= */
-      if (
-        status === "delivered"
-      ) {
+      if (status === "delivered") {
 
         await orderRef.update({
 
-          status:
-            "delivered",
-
-          driverStatus:
-            "delivered",
-
-          updatedAt:
-            now()
+          status: "delivered",
+          driverStatus: "delivered",
+          updatedAt: now()
         });
 
         await updateDriverRequestStatus(
-
           driverId,
-
           orderId,
-
           "delivered"
         );
 
-        return res.json({
-
-          success: true
-        });
+        return res.json({ success: true });
       }
 
-      /* =======================================================
-         🔥 COMPLETED
-      ======================================================= */
-      if (
-        status === "completed"
-      ) {
+      if (status === "completed") {
 
         await orderRef.update({
 
-          status:
-            "completed",
-
-          driverStatus:
-            "completed",
-
-          completedAt:
-            now(),
-
-          updatedAt:
-            now()
+          status: "completed",
+          driverStatus: "completed",
+          completedAt: now(),
+          updatedAt: now()
         });
 
         await updateDriverRequestStatus(
-
           driverId,
-
           orderId,
-
           "completed"
         );
 
-        await removeRequestFromAllDrivers(
-          orderId
-        );
+        await removeRequestFromAllDrivers(orderId);
 
         await rtdb
           .ref(
@@ -1827,52 +1724,30 @@ app.post(
           .update({
 
             isBusy: false,
-
             currentTrip: null,
-
             currentRequest: null
           });
 
-        return res.json({
-
-          success: true
-        });
+        return res.json({ success: true });
       }
 
-      /* =======================================================
-         🔥 CANCELLED
-      ======================================================= */
-      if (
-        status === "cancelled"
-      ) {
+      if (status === "cancelled") {
 
         await orderRef.update({
 
-          status:
-            "cancelled",
-
-          driverStatus:
-            "cancelled",
-
-          cancelledAt:
-            now(),
-
-          updatedAt:
-            now()
+          status: "cancelled",
+          driverStatus: "cancelled",
+          cancelledAt: now(),
+          updatedAt: now()
         });
 
         await updateDriverRequestStatus(
-
           driverId,
-
           orderId,
-
           "cancelled"
         );
 
-        await removeRequestFromAllDrivers(
-          orderId
-        );
+        await removeRequestFromAllDrivers(orderId);
 
         await rtdb
           .ref(
@@ -1881,40 +1756,24 @@ app.post(
           .update({
 
             isBusy: false,
-
             currentTrip: null,
-
             currentRequest: null
           });
 
-        return res.json({
-
-          success: true
-        });
+        return res.json({ success: true });
       }
 
       return res
         .status(400)
-        .json({
-
-          error:
-            "Unhandled status"
-        });
+        .json({ error: "Unhandled status" });
 
     } catch (error) {
 
-      console.log(
-        "updateTripStatus error",
-        error
-      );
+      console.log("updateTripStatus error", error);
 
       return res
         .status(500)
-        .json({
-
-          error:
-            error.message
-        });
+        .json({ error: error.message });
     }
   }
 );
@@ -1923,597 +1782,216 @@ app.post(
    🔥 FIRESTORE ORDERS LISTENER
 ======================================================= */
 db.collection("orders")
-  .onSnapshot(
-    async (snapshot) => {
+  .onSnapshot(async (snapshot) => {
 
-      for (
-        const change of
-        snapshot.docChanges()
+    for (const change of snapshot.docChanges()) {
+
+      const doc = change.doc;
+      const data = doc.data() || {};
+      const orderId = doc.id;
+
+      const workflowType = val(data.workflowType);
+      const status = val(data.status);
+      const driverStatus = val(data.driverStatus);
+
+      if (
+        (change.type === "added" || change.type === "modified") &&
+        (workflowType === "store_delivery" || workflowType === "delivery") &&
+        status === "ready_for_pickup" &&
+        driverStatus === "waiting"
       ) {
+        await dispatchOrder(orderId, data);
+      }
 
-        const doc =
-          change.doc;
+      if (
+        (change.type === "added" || change.type === "modified") &&
+        workflowType === "direct_trip" &&
+        status === "pending" &&
+        driverStatus === "waiting"
+      ) {
+        await dispatchOrder(orderId, data);
+      }
 
-        const data =
-          doc.data() || {};
+      if (status === "completed" || status === "cancelled") {
 
-        const orderId =
-          doc.id;
+        if (data.driverId) {
 
-        const workflowType =
-          val(
-            data.workflowType
-          );
-
-        const status =
-          val(
-            data.status
-          );
-
-        const driverStatus =
-          val(
-            data.driverStatus
-          );
-
-        if (
-
-          (
-            change.type ===
-            "added" ||
-
-            change.type ===
-            "modified"
-          ) &&
-
-          (
-            workflowType ===
-              "store_delivery" ||
-
-            workflowType ===
-              "delivery"
-          ) &&
-
-          status ===
-            "ready_for_pickup" &&
-
-          driverStatus ===
-            "waiting"
-
-        ) {
-
-          console.log(
-            "Starting store delivery dispatch"
-          );
-
-          await dispatchOrder(
-            orderId,
-            data
-          );
+          await rtdb
+            .ref(`drivers_online/${data.driverId}`)
+            .update({
+              isBusy: false,
+              currentTrip: null,
+              currentRequest: null
+            });
         }
 
-        if (
-
-          (
-            change.type ===
-            "added" ||
-
-            change.type ===
-            "modified"
-          ) &&
-
-          workflowType ===
-            "direct_trip" &&
-
-          status ===
-            "pending" &&
-
-          driverStatus ===
-            "waiting"
-
-        ) {
-
-          console.log(
-            "Starting direct trip dispatch"
-          );
-
-          await dispatchOrder(
-            orderId,
-            data
-          );
-        }
-
-        if (
-
-          status ===
-            "completed" ||
-
-          status ===
-            "cancelled"
-
-        ) {
-
-          if (
-            data.driverId
-          ) {
-
-            await rtdb
-              .ref(
-                `drivers_online/${data.driverId}`
-              )
-              .update({
-
-                isBusy: false,
-
-                currentTrip:
-                  null,
-
-                currentRequest:
-                  null
-              });
-          }
-
-          await removeRequestFromAllDrivers(
-            orderId
-          );
-        }
+        await removeRequestFromAllDrivers(orderId);
       }
     }
-  );
+  });
 
 /* =======================================================
    🚕 GET RIDE OPTIONS
 ======================================================= */
-app.post(
-  "/getRideOptions",
-  async (req, res) => {
+app.post("/getRideOptions", async (req, res) => {
 
-    try {
+  try {
 
-      const body =
-        req.body || {};
+    const body = req.body || {};
 
-      const pickupLat =
-        Number(
-          body.pickupLat
-        );
+    const pickupLat = Number(body.pickupLat);
+    const pickupLng = Number(body.pickupLng);
+    const dropLat = Number(body.dropLat);
+    const dropLng = Number(body.dropLng);
 
-      const pickupLng =
-        Number(
-          body.pickupLng
-        );
+    const serviceType = (body.serviceType || "ride").toLowerCase();
 
-      const dropLat =
-        Number(
-          body.dropLat
-        );
+    const tripKm = haversine(
+      pickupLat,
+      pickupLng,
+      dropLat,
+      dropLng
+    );
 
-      const dropLng =
-        Number(
-          body.dropLng
-        );
+    let categories = [];
 
-      const serviceType =
-        (
-          body.serviceType ||
-          "ride"
-        ).toLowerCase();
+    if (serviceType === "ride") {
+      categories = ["economy", "comfort", "premium", "women", "aletwende", "xl", "xxl"];
+    }
 
-      const tripKm =
-        haversine(
+    if (serviceType === "courier" || serviceType === "package") {
+      categories = ["delivery_bicycle", "delivery_motorbike", "delivery_car"];
+    }
 
-          pickupLat,
+    if (serviceType === "delivery") {
+      categories = ["delivery_bicycle", "delivery_motorbike", "delivery_car", "open_truck", "closed_truck"];
+    }
 
-          pickupLng,
+    if (serviceType === "delivery_truck") {
+      categories = ["delivery_truck"];
+    }
 
-          dropLat,
+    const onlineSnap = await rtdb.ref("drivers_online").once("value");
+    const locationSnap = await rtdb.ref("driver_locations").once("value");
 
-          dropLng
-        );
+    const online = onlineSnap.val() || {};
+    const locations = locationSnap.val() || {};
 
-      let categories =
-        [];
+    const driversSnap = await db.collection("drivers").get();
 
-      if (
-        serviceType ===
-        "ride"
-      ) {
+    const drivers = [];
 
-        categories = [
+    driversSnap.forEach((doc) => {
 
-          "economy",
+      const d = doc.data() || {};
+      const uid = d.uid || doc.id;
 
-          "comfort",
+      if (!uid) return;
+      if (!online[uid]?.isOnline) return;
+      if (online[uid]?.isBusy) return;
+      if (!locations[uid]?.l) return;
+      if (!d.vehicle) return;
 
-          "premium",
+      if (!d.vehicle.services.includes(serviceType)) return;
 
-          "women",
+      const lat = Number(locations[uid].l[0]);
+      const lng = Number(locations[uid].l[1]);
 
-          "aletwende",
+      const distance = haversine(pickupLat, pickupLng, lat, lng);
 
-          "xl",
+      if (distance > 7) return;
 
-          "xxl"
-        ];
-      }
+      drivers.push({
+        uid,
+        distance,
+        vehicle: d.vehicle
+      });
+    });
 
-      if (
+    const cards = [];
 
-        serviceType ===
-          "courier" ||
+    const DISPLAY_NAMES = {
+      delivery_car: "Car",
+      delivery_motorbike: "Motorbike",
+      delivery_bicycle: "Bicycle",
+      open_truck: "Open Truck",
+      closed_truck: "Closed Truck",
+      economy: "Economy",
+      comfort: "Comfort",
+      premium: "Premium",
+      xl: "XL",
+      xxl: "XXL"
+    };
 
-        serviceType ===
-          "package"
+    for (const category of categories) {
 
-      ) {
-
-        categories = [
-
-          "delivery_bicycle",
-
-          "delivery_motorbike",
-
-          "delivery_car"
-        ];
-      }
-
-      if (
-        serviceType ===
-        "delivery"
-      ) {
-
-        categories = [
-
-          "delivery_bicycle",
-
-          "delivery_motorbike",
-
-          "delivery_car",
-
-          "open_truck",
-
-          "closed_truck"
-        ];
-      }
-
-      if (
-
-        serviceType ===
-          "delivery_truck"
-
-      ) {
-
-        categories = [
-          "delivery_truck"
-        ];
-      }
-
-      const onlineSnap =
-        await rtdb
-          .ref(
-            "drivers_online"
-          )
-          .once("value");
-
-      const locationSnap =
-        await rtdb
-          .ref(
-            "driver_locations"
-          )
-          .once("value");
-
-      const online =
-        onlineSnap.val() || {};
-
-      const locations =
-        locationSnap.val() || {};
-
-      const driversSnap =
-        await db
-          .collection(
-            "drivers"
-          )
-          .get();
-
-      const drivers = [];
-
-      driversSnap.forEach(
-        (doc) => {
-
-          const d =
-            doc.data() || {};
-
-          const uid =
-            d.uid || doc.id;
-
-          if (!uid) return;
-
-          if (
-            !online[uid]
-              ?.isOnline
-          ) return;
-
-          if (
-            online[uid]
-              ?.isBusy
-          ) return;
-
-          if (
-            !locations[uid]
-              ?.l
-          ) return;
-
-          if (
-            !d.vehicle
-          ) return;
-
-          if (
-
-            !d.vehicle
-              .services
-              .includes(
-                serviceType
-              )
-
-          ) return;
-
-          const lat =
-            Number(
-              locations[
-                uid
-              ].l[0]
-            );
-
-          const lng =
-            Number(
-              locations[
-                uid
-              ].l[1]
-            );
-
-          const distance =
-            haversine(
-
-              pickupLat,
-
-              pickupLng,
-
-              lat,
-
-              lng
-            );
-
-          if (
-            distance > 7
-          ) return;
-
-          drivers.push({
-
-            uid,
-
-            distance,
-
-            vehicle:
-              d.vehicle
-          });
-        }
+      const match = drivers.find(
+        (d) => d.vehicle.vehicleCategory.includes(category)
       );
 
-      const cards = [];
-
-      const DISPLAY_NAMES = {
-
-        delivery_car:
-          "Car",
-
-        delivery_motorbike:
-          "Motorbike",
-
-        delivery_bicycle:
-          "Bicycle",
-
-        open_truck:
-          "Open Truck",
-
-        closed_truck:
-          "Closed Truck",
-
-        economy:
-          "Economy",
-
-        comfort:
-          "Comfort",
-
-        premium:
-          "Premium",
-
-        xl:
-          "XL",
-
-        xxl:
-          "XXL"
-      };
-
-      for (
-        const category of categories
-      ) {
-
-        const match =
-          drivers.find(
-
-            (d) =>
-
-              d.vehicle
-                .vehicleCategory
-                .includes(
-                  category
-                )
-          );
-
-        if (
-          !match
-        ) {
-
-          cards.push({
-
-            category,
-
-            title:
-              DISPLAY_NAMES[
-                category
-              ] || category,
-
-            enabled:
-              false,
-
-            eta:
-              null,
-
-            price:
-              null,
-
-            seats:
-              null,
-
-            image:
-              `${category}.png`
-          });
-
-          continue;
-        }
-
-        const pricingKey =
-          match.vehicle
-            .pricingCategory
-            .find(
-
-              (p) =>
-                p.includes(
-                  category
-                )
-            ) ||
-
-          match.vehicle
-            .pricingCategory[0];
-
-        const pricingDoc =
-          await db
-            .collection(
-              "pricing"
-            )
-            .doc(
-              pricingKey
-            )
-            .get();
-
-        let baseFare = 40;
-
-        if (
-          pricingDoc.exists
-        ) {
-
-          baseFare =
-            pricingDoc.data()
-              .baseFare || 40;
-        }
-
-        const eta =
-          Math.max(
-
-            2,
-
-            Math.round(
-              match.distance * 2
-            )
-          );
-
-        const price =
-          calculateFare(
-
-            baseFare,
-
-            tripKm
-          );
+      if (!match) {
 
         cards.push({
-
           category,
-
-          title:
-            DISPLAY_NAMES[
-              category
-            ] || category,
-
-          dispatchService:
-            pricingKey,
-
-          pricingCategory:
-            pricingKey,
-
-          enabled:
-            true,
-
-          eta,
-
-          price,
-
-          seats:
-            serviceType ===
-            "ride"
-
-              ? (
-                match.vehicle
-                  .maxSeats || 4
-              )
-
-              : null,
-
-          image:
-            `${category}.png`
+          title: DISPLAY_NAMES[category] || category,
+          enabled: false,
+          eta: null,
+          price: null,
+          seats: null,
+          image: `${category}.png`
         });
+
+        continue;
       }
 
-      return res.json(
-        cards
-      );
+      const pricingKey =
+        match.vehicle.pricingCategory.find((p) => p.includes(category)) ||
+        match.vehicle.pricingCategory[0];
 
-    } catch (error) {
+      const pricingDoc = await db.collection("pricing").doc(pricingKey).get();
 
-      return res
-        .status(500)
-        .json({
+      let baseFare = 40;
 
-          error:
-            error.message
-        });
+      if (pricingDoc.exists) {
+        baseFare = pricingDoc.data().baseFare || 40;
+      }
+
+      const eta = Math.max(2, Math.round(match.distance * 2));
+
+      const price = calculateFare(baseFare, tripKm);
+
+      cards.push({
+        category,
+        title: DISPLAY_NAMES[category] || category,
+        dispatchService: pricingKey,
+        pricingCategory: pricingKey,
+        enabled: true,
+        eta,
+        price,
+        seats: serviceType === "ride" ? (match.vehicle.maxSeats || 4) : null,
+        image: `${category}.png`
+      });
     }
+
+    return res.json(cards);
+
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
   }
-);
+});
 
 /* =======================================================
    HOME
 ======================================================= */
-app.get(
-  "/",
-  (req, res) => {
-
-    res.send(
-      "Backend running 🚀"
-    );
-  }
-);
+app.get("/", (req, res) => {
+  res.send("Backend running 🚀");
+});
 
 /* =======================================================
    START SERVER
 ======================================================= */
-const PORT =
-  process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000;
 
-app.listen(
-  PORT,
-  () => {
-
-    console.log(
-      `Server running on port ${PORT}`
-    );
-  }
-);
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
