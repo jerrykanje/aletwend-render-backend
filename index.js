@@ -1,4 +1,4 @@
-  const express = require("express");
+ const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 
@@ -36,6 +36,81 @@ const val = (x) => x ?? "";
 
 const now = () =>
   admin.firestore.FieldValue.serverTimestamp();
+
+/* =======================================================
+   🔥 BUILD DRIVER SNAPSHOT
+======================================================= */
+async function buildDriverSnapshot(
+  driverId
+) {
+
+  try {
+
+    if (!driverId) {
+      return null;
+    }
+
+    const driverDoc =
+      await db
+        .collection("drivers")
+        .doc(driverId)
+        .get();
+
+    if (!driverDoc.exists) {
+      return null;
+    }
+
+    const driverData =
+      driverDoc.data() || {};
+
+    const vehicle =
+      driverData.vehicle || {};
+
+    return {
+
+      uid: driverId,
+
+      firstName:
+        driverData.firstName || "",
+
+      phone:
+        driverData.phone || "",
+
+      profilePicture:
+        driverData.profilePicture || "",
+
+      rating:
+        driverData.rating || 0,
+
+      vehicle: {
+
+        brand:
+          vehicle.brand || "",
+
+        model:
+          vehicle.model || "",
+
+        color:
+          vehicle.color || "",
+
+        plateNumber:
+          vehicle.plateNumber || "",
+
+        type:
+          vehicle.type || ""
+      }
+    };
+
+  } catch (error) {
+
+    console.log(
+      "buildDriverSnapshot error",
+      error
+    );
+
+    return null;
+  }
+}
 
 /* =======================================================
    🔥 RTDB REQUEST STATUS SYNC
@@ -1181,7 +1256,10 @@ async function dispatchOrder(
 
     if (
       workflowType ===
-      "store_delivery"
+      "store_delivery" ||
+
+      workflowType ===
+      "delivery"
     ) {
 
       await db
@@ -1252,10 +1330,10 @@ async function dispatchOrder(
 }
 
 /* =======================================================
-   🔥 DRIVER ACCEPT REQUEST
+   🔥 CENTRALIZED UPDATE TRIP STATUS
 ======================================================= */
 app.post(
-  "/acceptDriverRequest",
+  "/updateTripStatus",
   async (req, res) => {
 
     try {
@@ -1269,9 +1347,13 @@ app.post(
       const driverId =
         val(body.driverId);
 
+      const status =
+        val(body.status);
+
       if (
         !orderId ||
-        !driverId
+        !driverId ||
+        !status
       ) {
 
         return res
@@ -1279,7 +1361,43 @@ app.post(
           .json({
 
             error:
-              "Missing orderId or driverId"
+              "Missing orderId, driverId or status"
+          });
+      }
+
+      const allowedStatuses = [
+
+        "accepted",
+
+        "declined",
+
+        "arrived",
+
+        "started",
+
+        "completed",
+
+        "at_store",
+
+        "picked_up",
+
+        "delivered",
+
+        "cancelled"
+      ];
+
+      if (
+        !allowedStatuses.includes(
+          status
+        )
+      ) {
+
+        return res
+          .status(400)
+          .json({
+
+            error:
+              "Invalid status"
           });
       }
 
@@ -1312,245 +1430,177 @@ app.post(
           orderData.workflowType
         );
 
+      /* =======================================================
+         🔥 DECLINED
+      ======================================================= */
       if (
-        workflowType ===
-        "direct_trip"
+        status === "declined"
       ) {
 
-        await orderRef.update({
-
+        await removeDriverRequest(
           driverId,
+          orderId
+        );
 
-          status:
-            "accepted",
-
-          driverStatus:
-            "assigned",
-
-          acceptedAt:
-            now(),
-
-          updatedAt:
-            now()
-        });
-      }
-
-      if (
-        workflowType ===
-        "store_delivery"
-      ) {
-
-        await orderRef.update({
-
-          driverId,
-
-          status:
-            "assigned",
-
-          driverStatus:
-            "assigned",
-
-          acceptedAt:
-            now(),
-
-          updatedAt:
-            now()
-        });
-      }
-
-      await updateDriverRequestStatus(
-
-        driverId,
-
-        orderId,
-
-        "accepted"
-      );
-
-      await rtdb
-        .ref(
-          `drivers_online/${driverId}`
-        )
-        .update({
-
-          isBusy: true,
-
-          currentTrip:
-            orderId,
-
-          currentRequest:
-            null
-        });
-
-      const requestSnap =
         await rtdb
           .ref(
-            "driver_trip_requests"
+            `drivers_online/${driverId}`
           )
-          .once("value");
+          .update({
 
-      const requests =
-        requestSnap.val() || {};
+            currentRequest:
+              null
+          });
 
-      for (
-        const uid of Object.keys(
-          requests
-        )
+        return res.json({
+
+          success: true
+        });
+      }
+
+      /* =======================================================
+         🔥 ACCEPTED
+      ======================================================= */
+      if (
+        status === "accepted"
       ) {
+
+        /* =======================================================
+           🔥 BUILD DRIVER SNAPSHOT
+        ======================================================= */
+        const driverSnapshot =
+          await buildDriverSnapshot(
+            driverId
+          );
 
         if (
-          uid !== driverId
+
+          workflowType ===
+          "direct_trip"
+
         ) {
 
+          await orderRef.update({
+
+            driverId,
+
+            driver:
+              driverSnapshot,
+
+            status:
+              "accepted",
+
+            driverStatus:
+              "assigned",
+
+            acceptedAt:
+              now(),
+
+            updatedAt:
+              now()
+          });
+        }
+
+        if (
+
+          workflowType ===
+            "store_delivery" ||
+
+          workflowType ===
+            "delivery"
+
+        ) {
+
+          await orderRef.update({
+
+            driverId,
+
+            driver:
+              driverSnapshot,
+
+            status:
+              "driver_assigned",
+
+            driverStatus:
+              "assigned",
+
+            acceptedAt:
+              now(),
+
+            updatedAt:
+              now()
+          });
+        }
+
+        await updateDriverRequestStatus(
+
+          driverId,
+
+          orderId,
+
+          "accepted",
+
+          {
+            driver:
+              driverSnapshot
+          }
+        );
+
+        await rtdb
+          .ref(
+            `drivers_online/${driverId}`
+          )
+          .update({
+
+            isBusy: true,
+
+            currentTrip:
+              orderId,
+
+            currentRequest:
+              null
+          });
+
+        const requestSnap =
           await rtdb
             .ref(
-              `driver_trip_requests/${uid}/${orderId}`
+              "driver_trip_requests"
             )
-            .remove();
+            .once("value");
+
+        const requests =
+          requestSnap.val() || {};
+
+        for (
+          const uid of Object.keys(
+            requests
+          )
+        ) {
+
+          if (
+            uid !== driverId
+          ) {
+
+            await rtdb
+              .ref(
+                `driver_trip_requests/${uid}/${orderId}`
+              )
+              .remove();
+          }
         }
-      }
 
-      return res.json({
+        return res.json({
 
-        success: true
-      });
+          success: true,
 
-    } catch (error) {
-
-      return res
-        .status(500)
-        .json({
-
-          error:
-            error.message
+          driver:
+            driverSnapshot
         });
-    }
-  }
-);
-
-/* =======================================================
-   🔥 DRIVER DECLINE REQUEST
-======================================================= */
-app.post(
-  "/declineDriverRequest",
-  async (req, res) => {
-
-    try {
-
-      const body =
-        req.body || {};
-
-      const orderId =
-        val(body.orderId);
-
-      const driverId =
-        val(body.driverId);
-
-      if (
-        !orderId ||
-        !driverId
-      ) {
-
-        return res
-          .status(400)
-          .json({
-
-            error:
-              "Missing orderId or driverId"
-          });
       }
 
-      await removeDriverRequest(
-        driverId,
-        orderId
-      );
-
-      await rtdb
-        .ref(
-          `drivers_online/${driverId}`
-        )
-        .update({
-
-          currentRequest:
-            null
-        });
-
-      return res.json({
-
-        success: true
-      });
-
-    } catch (error) {
-
-      return res
-        .status(500)
-        .json({
-
-          error:
-            error.message
-        });
-    }
-  }
-);
-
-/* =======================================================
-   🔥 DRIVER ARRIVED
-======================================================= */
-app.post(
-  "/arrivedAtPickup",
-  async (req, res) => {
-
-    try {
-
-      const body =
-        req.body || {};
-
-      const orderId =
-        val(body.orderId);
-
-      const status =
-        val(body.status);
-
-      const driverId =
-        val(body.driverId);
-
-      if (
-        !orderId ||
-        !status ||
-        !driverId
-      ) {
-
-        return res
-          .status(400)
-          .json({
-
-            error:
-              "Missing orderId, status or driverId"
-          });
-      }
-
-      const orderRef =
-        db
-          .collection("orders")
-          .doc(orderId);
-
-      const orderDoc =
-        await orderRef.get();
-
-      if (!orderDoc.exists) {
-
-        return res
-          .status(404)
-          .json({
-
-            error:
-              "Order not found"
-          });
-      }
-
-      const orderData =
-        orderDoc.data() || {};
-
+      /* =======================================================
+         🔥 DRIVER VALIDATION
+      ======================================================= */
       if (
         orderData.driverId !==
         driverId
@@ -1565,725 +1615,298 @@ app.post(
           });
       }
 
-      await orderRef.update({
+      /* =======================================================
+         🔥 ARRIVED
+      ======================================================= */
+      if (
+        status === "arrived"
+      ) {
 
-        status:
-          "arrived",
+        await orderRef.update({
 
-        driverStatus:
-          "arrived",
+          status:
+            "arrived",
 
-        updatedAt:
-          now()
-      });
+          driverStatus:
+            "arrived",
 
-      await updateDriverRequestStatus(
+          updatedAt:
+            now()
+        });
 
-        driverId,
+        await updateDriverRequestStatus(
 
-        orderId,
+          driverId,
 
-        "arrived"
-      );
+          orderId,
 
-      return res.json({
+          "arrived"
+        );
 
-        success: true
-      });
+        return res.json({
 
-    } catch (error) {
+          success: true
+        });
+      }
+
+      /* =======================================================
+         🔥 STARTED
+      ======================================================= */
+      if (
+        status === "started"
+      ) {
+
+        await orderRef.update({
+
+          status:
+            "started",
+
+          driverStatus:
+            "started",
+
+          updatedAt:
+            now()
+        });
+
+        await updateDriverRequestStatus(
+
+          driverId,
+
+          orderId,
+
+          "started"
+        );
+
+        return res.json({
+
+          success: true
+        });
+      }
+
+      /* =======================================================
+         🔥 AT STORE
+      ======================================================= */
+      if (
+        status === "at_store"
+      ) {
+
+        await orderRef.update({
+
+          status:
+            "at_store",
+
+          driverStatus:
+            "at_store",
+
+          updatedAt:
+            now()
+        });
+
+        await updateDriverRequestStatus(
+
+          driverId,
+
+          orderId,
+
+          "at_store"
+        );
+
+        return res.json({
+
+          success: true
+        });
+      }
+
+      /* =======================================================
+         🔥 PICKED UP
+      ======================================================= */
+      if (
+        status === "picked_up"
+      ) {
+
+        await orderRef.update({
+
+          status:
+            "picked_up",
+
+          driverStatus:
+            "picked_up",
+
+          updatedAt:
+            now()
+        });
+
+        await updateDriverRequestStatus(
+
+          driverId,
+
+          orderId,
+
+          "picked_up"
+        );
+
+        return res.json({
+
+          success: true
+        });
+      }
+
+      /* =======================================================
+         🔥 DELIVERED
+      ======================================================= */
+      if (
+        status === "delivered"
+      ) {
+
+        await orderRef.update({
+
+          status:
+            "delivered",
+
+          driverStatus:
+            "delivered",
+
+          updatedAt:
+            now()
+        });
+
+        await updateDriverRequestStatus(
+
+          driverId,
+
+          orderId,
+
+          "delivered"
+        );
+
+        return res.json({
+
+          success: true
+        });
+      }
+
+      /* =======================================================
+         🔥 COMPLETED
+      ======================================================= */
+      if (
+        status === "completed"
+      ) {
+
+        await orderRef.update({
+
+          status:
+            "completed",
+
+          driverStatus:
+            "completed",
+
+          completedAt:
+            now(),
+
+          updatedAt:
+            now()
+        });
+
+        await updateDriverRequestStatus(
+
+          driverId,
+
+          orderId,
+
+          "completed"
+        );
+
+        await removeRequestFromAllDrivers(
+          orderId
+        );
+
+        await rtdb
+          .ref(
+            `drivers_online/${driverId}`
+          )
+          .update({
+
+            isBusy: false,
+
+            currentTrip: null,
+
+            currentRequest: null
+          });
+
+        return res.json({
+
+          success: true
+        });
+      }
+
+      /* =======================================================
+         🔥 CANCELLED
+      ======================================================= */
+      if (
+        status === "cancelled"
+      ) {
+
+        await orderRef.update({
+
+          status:
+            "cancelled",
+
+          driverStatus:
+            "cancelled",
+
+          cancelledAt:
+            now(),
+
+          updatedAt:
+            now()
+        });
+
+        await updateDriverRequestStatus(
+
+          driverId,
+
+          orderId,
+
+          "cancelled"
+        );
+
+        await removeRequestFromAllDrivers(
+          orderId
+        );
+
+        await rtdb
+          .ref(
+            `drivers_online/${driverId}`
+          )
+          .update({
+
+            isBusy: false,
+
+            currentTrip: null,
+
+            currentRequest: null
+          });
+
+        return res.json({
+
+          success: true
+        });
+      }
 
       return res
-        .status(500)
+        .status(400)
         .json({
 
           error:
-            error.message
+            "Unhandled status"
         });
-    }
-  }
-);
-
-/* =======================================================
-   🔥 START DIRECT TRIP
-======================================================= */
-app.post(
-  "/startTrip",
-  async (req, res) => {
-
-    try {
-
-      const body =
-        req.body || {};
-
-      const orderId =
-        val(body.orderId);
-
-      const status =
-        val(body.status);
-
-      const driverId =
-        val(body.driverId);
-
-      if (
-        !orderId ||
-        !status ||
-        !driverId
-      ) {
-
-        return res
-          .status(400)
-          .json({
-
-            error:
-              "Missing orderId, status or driverId"
-          });
-      }
-
-      const orderRef =
-        db
-          .collection("orders")
-          .doc(orderId);
-
-      const orderDoc =
-        await orderRef.get();
-
-      if (!orderDoc.exists) {
-
-        return res
-          .status(404)
-          .json({
-
-            error:
-              "Order not found"
-          });
-      }
-
-      const orderData =
-        orderDoc.data() || {};
-
-      if (
-        orderData.driverId !==
-        driverId
-      ) {
-
-        return res
-          .status(403)
-          .json({
-
-            error:
-              "Driver mismatch"
-          });
-      }
-
-      await orderRef.update({
-
-        status:
-          "started",
-
-        driverStatus:
-          "started",
-
-        updatedAt:
-          now()
-      });
-
-      await updateDriverRequestStatus(
-
-        driverId,
-
-        orderId,
-
-        "started"
-      );
-
-      return res.json({
-
-        success: true
-      });
 
     } catch (error) {
 
-      return res
-        .status(500)
-        .json({
-
-          error:
-            error.message
-        });
-    }
-  }
-);
-
-/* =======================================================
-   🔥 DRIVER AT STORE
-======================================================= */
-app.post(
-  "/driverAtStore",
-  async (req, res) => {
-
-    try {
-
-      const body =
-        req.body || {};
-
-      const orderId =
-        val(body.orderId);
-
-      const status =
-        val(body.status);
-
-      const driverId =
-        val(body.driverId);
-
-      if (
-        !orderId ||
-        !status ||
-        !driverId
-      ) {
-
-        return res
-          .status(400)
-          .json({
-
-            error:
-              "Missing orderId, status or driverId"
-          });
-      }
-
-      const orderRef =
-        db
-          .collection("orders")
-          .doc(orderId);
-
-      const orderDoc =
-        await orderRef.get();
-
-      if (!orderDoc.exists) {
-
-        return res
-          .status(404)
-          .json({
-
-            error:
-              "Order not found"
-          });
-      }
-
-      const orderData =
-        orderDoc.data() || {};
-
-      if (
-        orderData.driverId !==
-        driverId
-      ) {
-
-        return res
-          .status(403)
-          .json({
-
-            error:
-              "Driver mismatch"
-          });
-      }
-
-      await orderRef.update({
-
-        status:
-          "at_store",
-
-        driverStatus:
-          "at_store",
-
-        updatedAt:
-          now()
-      });
-
-      await updateDriverRequestStatus(
-
-        driverId,
-
-        orderId,
-
-        "at_store"
+      console.log(
+        "updateTripStatus error",
+        error
       );
-
-      return res.json({
-
-        success: true
-      });
-
-    } catch (error) {
-
-      return res
-        .status(500)
-        .json({
-
-          error:
-            error.message
-        });
-    }
-  }
-);
-
-/* =======================================================
-   🔥 PICKED UP
-======================================================= */
-app.post(
-  "/pickedUpOrder",
-  async (req, res) => {
-
-    try {
-
-      const body =
-        req.body || {};
-
-      const orderId =
-        val(body.orderId);
-
-      const status =
-        val(body.status);
-
-      const driverId =
-        val(body.driverId);
-
-      if (
-        !orderId ||
-        !status ||
-        !driverId
-      ) {
-
-        return res
-          .status(400)
-          .json({
-
-            error:
-              "Missing orderId, status or driverId"
-          });
-      }
-
-      const orderRef =
-        db
-          .collection("orders")
-          .doc(orderId);
-
-      const orderDoc =
-        await orderRef.get();
-
-      if (!orderDoc.exists) {
-
-        return res
-          .status(404)
-          .json({
-
-            error:
-              "Order not found"
-          });
-      }
-
-      const orderData =
-        orderDoc.data() || {};
-
-      if (
-        orderData.driverId !==
-        driverId
-      ) {
-
-        return res
-          .status(403)
-          .json({
-
-            error:
-              "Driver mismatch"
-          });
-      }
-
-      await orderRef.update({
-
-        status:
-          "picked_up",
-
-        driverStatus:
-          "picked_up",
-
-        updatedAt:
-          now()
-      });
-
-      await updateDriverRequestStatus(
-
-        driverId,
-
-        orderId,
-
-        "picked_up"
-      );
-
-      return res.json({
-
-        success: true
-      });
-
-    } catch (error) {
-
-      return res
-        .status(500)
-        .json({
-
-          error:
-            error.message
-        });
-    }
-  }
-);
-
-/* =======================================================
-   🔥 DELIVERED
-======================================================= */
-app.post(
-  "/deliveredOrder",
-  async (req, res) => {
-
-    try {
-
-      const body =
-        req.body || {};
-
-      const orderId =
-        val(body.orderId);
-
-      const status =
-        val(body.status);
-
-      const driverId =
-        val(body.driverId);
-
-      if (
-        !orderId ||
-        !status ||
-        !driverId
-      ) {
-
-        return res
-          .status(400)
-          .json({
-
-            error:
-              "Missing orderId, status or driverId"
-          });
-      }
-
-      const orderRef =
-        db
-          .collection("orders")
-          .doc(orderId);
-
-      const orderDoc =
-        await orderRef.get();
-
-      if (!orderDoc.exists) {
-
-        return res
-          .status(404)
-          .json({
-
-            error:
-              "Order not found"
-          });
-      }
-
-      const orderData =
-        orderDoc.data() || {};
-
-      if (
-        orderData.driverId !==
-        driverId
-      ) {
-
-        return res
-          .status(403)
-          .json({
-
-            error:
-              "Driver mismatch"
-          });
-      }
-
-      await orderRef.update({
-
-        status:
-          "delivered",
-
-        driverStatus:
-          "delivered",
-
-        updatedAt:
-          now()
-      });
-
-      await updateDriverRequestStatus(
-
-        driverId,
-
-        orderId,
-
-        "delivered"
-      );
-
-      return res.json({
-
-        success: true
-      });
-
-    } catch (error) {
-
-      return res
-        .status(500)
-        .json({
-
-          error:
-            error.message
-        });
-    }
-  }
-);
-
-/* =======================================================
-   🔥 COMPLETE TRIP
-======================================================= */
-app.post(
-  "/completeTrip",
-  async (req, res) => {
-
-    try {
-
-      const body =
-        req.body || {};
-
-      const orderId =
-        val(body.orderId);
-
-      const driverId =
-        val(body.driverId);
-
-      if (
-        !orderId ||
-        !driverId
-      ) {
-
-        return res
-          .status(400)
-          .json({
-
-            error:
-              "Missing orderId or driverId"
-          });
-      }
-
-      const orderRef =
-        db
-          .collection("orders")
-          .doc(orderId);
-
-      const orderDoc =
-        await orderRef.get();
-
-      if (!orderDoc.exists) {
-
-        return res
-          .status(404)
-          .json({
-
-            error:
-              "Order not found"
-          });
-      }
-
-      const orderData =
-        orderDoc.data() || {};
-
-      if (
-        orderData.driverId !==
-        driverId
-      ) {
-
-        return res
-          .status(403)
-          .json({
-
-            error:
-              "Driver mismatch"
-          });
-      }
-
-      await orderRef.update({
-
-        status:
-          "completed",
-
-        driverStatus:
-          "completed",
-
-        completedAt:
-          now()
-      });
-
-      await updateDriverRequestStatus(
-
-        driverId,
-
-        orderId,
-
-        "completed"
-      );
-
-      await removeRequestFromAllDrivers(
-        orderId
-      );
-
-      await rtdb
-        .ref(
-          `drivers_online/${driverId}`
-        )
-        .update({
-
-          isBusy: false,
-
-          currentTrip: null,
-
-          currentRequest: null
-        });
-
-      return res.json({
-
-        success: true
-      });
-
-    } catch (error) {
-
-      return res
-        .status(500)
-        .json({
-
-          error:
-            error.message
-        });
-    }
-  }
-);
-
-/* =======================================================
-   🔥 CANCEL TRIP
-======================================================= */
-app.post(
-  "/cancelTrip",
-  async (req, res) => {
-
-    try {
-
-      const body =
-        req.body || {};
-
-      const orderId =
-        val(body.orderId);
-
-      const driverId =
-        val(body.driverId);
-
-      if (
-        !orderId ||
-        !driverId
-      ) {
-
-        return res
-          .status(400)
-          .json({
-
-            error:
-              "Missing orderId or driverId"
-          });
-      }
-
-      const orderRef =
-        db
-          .collection("orders")
-          .doc(orderId);
-
-      const orderDoc =
-        await orderRef.get();
-
-      if (!orderDoc.exists) {
-
-        return res
-          .status(404)
-          .json({
-
-            error:
-              "Order not found"
-          });
-      }
-
-      const orderData =
-        orderDoc.data() || {};
-
-      if (
-        orderData.driverId !==
-        driverId
-      ) {
-
-        return res
-          .status(403)
-          .json({
-
-            error:
-              "Driver mismatch"
-          });
-      }
-
-      await orderRef.update({
-
-        status:
-          "cancelled",
-
-        driverStatus:
-          "cancelled",
-
-        cancelledAt:
-          now()
-      });
-
-      await updateDriverRequestStatus(
-
-        driverId,
-
-        orderId,
-
-        "cancelled"
-      );
-
-      await removeRequestFromAllDrivers(
-        orderId
-      );
-
-      await rtdb
-        .ref(
-          `drivers_online/${driverId}`
-        )
-        .update({
-
-          isBusy: false,
-
-          currentTrip: null,
-
-          currentRequest: null
-        });
-
-      return res.json({
-
-        success: true
-      });
-
-    } catch (error) {
 
       return res
         .status(500)
@@ -2342,8 +1965,13 @@ db.collection("orders")
             "modified"
           ) &&
 
-          workflowType ===
-            "store_delivery" &&
+          (
+            workflowType ===
+              "store_delivery" ||
+
+            workflowType ===
+              "delivery"
+          ) &&
 
           status ===
             "ready_for_pickup" &&
