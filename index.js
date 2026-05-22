@@ -1,4 +1,4 @@
-const express = require("express");
+ const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 
@@ -607,7 +607,7 @@ app.post(
 
         maxSeats,
 
-        carImage:
+        profilePicture:
           val(
             imageUrls.carImage
           ),
@@ -623,15 +623,6 @@ app.post(
           )
       };
 
-      const existingDriverDoc =
-        await db
-          .collection("drivers")
-          .doc(uid)
-          .get();
-
-      const existingDriverData =
-        existingDriverDoc.data() || {};
-
       await db
         .collection("drivers")
         .doc(uid)
@@ -640,19 +631,6 @@ app.post(
           {
 
             uid,
-
-            firstName:
-              val(
-                existingDriverData.firstName
-              ),
-
-            profilePicture:
-              val(
-                existingDriverData.profilePicture
-              ),
-
-            rating:
-              existingDriverData.rating || 0,
 
             updatedAt:
               now(),
@@ -1074,23 +1052,7 @@ async function findMatchingDriver(
 
           uid,
 
-          distance,
-
-          firstName:
-            val(
-              d.firstName
-            ),
-
-          profilePicture:
-            val(
-              d.profilePicture
-            ),
-
-          rating:
-            d.rating || 0,
-
-          vehicle:
-            d.vehicle
+          distance
         });
       }
     );
@@ -1130,15 +1092,6 @@ async function sendRequestToDriver(
         orderData.workflowType
       );
 
-    const driverDoc =
-      await db
-        .collection("drivers")
-        .doc(driverUid)
-        .get();
-
-    const driverData =
-      driverDoc.data() || {};
-
     const payload = {
 
       orderId,
@@ -1159,28 +1112,6 @@ async function sendRequestToDriver(
 
       expiresAt:
         Date.now() + 30000,
-
-      driver: {
-
-        uid:
-          driverUid,
-
-        firstName:
-          val(
-            driverData.firstName
-          ),
-
-        profilePicture:
-          val(
-            driverData.profilePicture
-          ),
-
-        rating:
-          driverData.rating || 0,
-
-        vehicle:
-          driverData.vehicle || {}
-      },
 
       data:
         orderData
@@ -1296,25 +1227,7 @@ async function dispatchOrder(
       .update({
 
         driverId:
-          matchedDriver.uid,
-
-        driver: {
-
-          uid:
-            matchedDriver.uid,
-
-          firstName:
-            matchedDriver.firstName,
-
-          profilePicture:
-            matchedDriver.profilePicture,
-
-          rating:
-            matchedDriver.rating,
-
-          vehicle:
-            matchedDriver.vehicle
-        }
+          matchedDriver.uid
       });
 
     await sendRequestToDriver(
@@ -1342,30 +1255,523 @@ async function dispatchOrder(
 }
 
 /* =======================================================
-   HOME
+   🔥 CENTRALIZED UPDATE TRIP STATUS
 ======================================================= */
-app.get(
-  "/",
-  (req, res) => {
+app.post(
+  "/updateTripStatus",
+  async (req, res) => {
 
-    res.send(
-      "Backend running 🚀"
-    );
+    try {
+
+      const body =
+        req.body || {};
+
+      const orderId =
+        val(body.orderId);
+
+      const driverId =
+        val(body.driverId);
+
+      const status =
+        val(body.status);
+
+      if (
+        !orderId ||
+        !driverId ||
+        !status
+      ) {
+
+        return res
+          .status(400)
+          .json({
+
+            error:
+              "Missing orderId, driverId or status"
+          });
+      }
+
+      const allowedStatuses = [
+
+        "accepted",
+
+        "declined",
+
+        "arrived",
+
+        "started",
+
+        "completed",
+
+        "at_store",
+
+        "picked_up",
+
+        "delivered",
+
+        "cancelled"
+      ];
+
+      if (
+        !allowedStatuses.includes(
+          status
+        )
+      ) {
+
+        return res
+          .status(400)
+          .json({
+
+            error:
+              "Invalid status"
+          });
+      }
+
+      const orderRef =
+        db
+          .collection("orders")
+          .doc(orderId);
+
+      const orderDoc =
+        await orderRef.get();
+
+      if (
+        !orderDoc.exists
+      ) {
+
+        return res
+          .status(404)
+          .json({
+
+            error:
+              "Order not found"
+          });
+      }
+
+      const orderData =
+        orderDoc.data() || {};
+
+      const workflowType =
+        val(
+          orderData.workflowType
+        );
+
+      if (
+        status === "declined"
+      ) {
+
+        await removeDriverRequest(
+          driverId,
+          orderId
+        );
+
+        await rtdb
+          .ref(
+            `drivers_online/${driverId}`
+          )
+          .update({
+
+            currentRequest:
+              null
+          });
+
+        return res.json({ success: true });
+      }
+
+      if (
+        status === "accepted"
+      ) {
+
+        if (
+          workflowType === "direct_trip"
+        ) {
+
+          await orderRef.update({
+
+            driverId,
+            status: "accepted",
+            driverStatus: "assigned",
+            acceptedAt: now(),
+            updatedAt: now()
+          });
+        }
+
+        if (
+          workflowType === "store_delivery" ||
+          workflowType === "delivery"
+        ) {
+
+          await orderRef.update({
+
+            driverId,
+            status: "driver_assigned",
+            driverStatus: "assigned",
+            acceptedAt: now(),
+            updatedAt: now()
+          });
+        }
+
+        await updateDriverRequestStatus(
+          driverId,
+          orderId,
+          "accepted"
+        );
+
+        await rtdb
+          .ref(`drivers_online/${driverId}`)
+          .update({
+            isBusy: true,
+            currentTrip: orderId,
+            currentRequest: null
+          });
+
+        const requestSnap =
+          await rtdb.ref("driver_trip_requests").once("value");
+
+        const requests = requestSnap.val() || {};
+
+        for (const uid of Object.keys(requests)) {
+          if (uid !== driverId) {
+            await rtdb
+              .ref(`driver_trip_requests/${uid}/${orderId}`)
+              .remove();
+          }
+        }
+
+        return res.json({ success: true });
+      }
+
+      if (orderData.driverId !== driverId) {
+        return res.status(403).json({ error: "Driver mismatch" });
+      }
+
+      if (status === "arrived") {
+        await orderRef.update({
+          status: "arrived",
+          driverStatus: "arrived",
+          updatedAt: now()
+        });
+
+        await updateDriverRequestStatus(driverId, orderId, "arrived");
+        return res.json({ success: true });
+      }
+
+      if (status === "started") {
+        await orderRef.update({
+          status: "started",
+          driverStatus: "started",
+          updatedAt: now()
+        });
+
+        await updateDriverRequestStatus(driverId, orderId, "started");
+        return res.json({ success: true });
+      }
+
+      if (status === "at_store") {
+        await orderRef.update({
+          status: "at_store",
+          driverStatus: "at_store",
+          updatedAt: now()
+        });
+
+        await updateDriverRequestStatus(driverId, orderId, "at_store");
+        return res.json({ success: true });
+      }
+
+      if (status === "picked_up") {
+        await orderRef.update({
+          status: "picked_up",
+          driverStatus: "picked_up",
+          updatedAt: now()
+        });
+
+        await updateDriverRequestStatus(driverId, orderId, "picked_up");
+        return res.json({ success: true });
+      }
+
+      if (status === "delivered") {
+        await orderRef.update({
+          status: "delivered",
+          driverStatus: "delivered",
+          updatedAt: now()
+        });
+
+        await updateDriverRequestStatus(driverId, orderId, "delivered");
+        return res.json({ success: true });
+      }
+
+      if (status === "completed") {
+        await orderRef.update({
+          status: "completed",
+          driverStatus: "completed",
+          completedAt: now(),
+          updatedAt: now()
+        });
+
+        await updateDriverRequestStatus(driverId, orderId, "completed");
+
+        await removeRequestFromAllDrivers(orderId);
+
+        await rtdb.ref(`drivers_online/${driverId}`).update({
+          isBusy: false,
+          currentTrip: null,
+          currentRequest: null
+        });
+
+        return res.json({ success: true });
+      }
+
+      if (status === "cancelled") {
+        await orderRef.update({
+          status: "cancelled",
+          driverStatus: "cancelled",
+          cancelledAt: now(),
+          updatedAt: now()
+        });
+
+        await updateDriverRequestStatus(driverId, orderId, "cancelled");
+
+        await removeRequestFromAllDrivers(orderId);
+
+        await rtdb.ref(`drivers_online/${driverId}`).update({
+          isBusy: false,
+          currentTrip: null,
+          currentRequest: null
+        });
+
+        return res.json({ success: true });
+      }
+
+      return res.status(400).json({ error: "Unhandled status" });
+
+    } catch (error) {
+
+      console.log("updateTripStatus error", error);
+
+      return res.status(500).json({ error: error.message });
+    }
   }
 );
 
 /* =======================================================
-   START SERVER
+   🔥 FIRESTORE ORDERS LISTENER
 ======================================================= */
-const PORT =
-  process.env.PORT || 3000;
+db.collection("orders").onSnapshot(async (snapshot) => {
+  for (const change of snapshot.docChanges()) {
 
-app.listen(
-  PORT,
-  () => {
+    const doc = change.doc;
+    const data = doc.data() || {};
+    const orderId = doc.id;
 
-    console.log(
-      `Server running on port ${PORT}`
-    );
+    const workflowType = val(data.workflowType);
+    const status = val(data.status);
+    const driverStatus = val(data.driverStatus);
+
+    if (
+      (change.type === "added" || change.type === "modified") &&
+      (workflowType === "store_delivery" || workflowType === "delivery") &&
+      status === "ready_for_pickup" &&
+      driverStatus === "waiting"
+    ) {
+      await dispatchOrder(orderId, data);
+    }
+
+    if (
+      (change.type === "added" || change.type === "modified") &&
+      workflowType === "direct_trip" &&
+      status === "pending" &&
+      driverStatus === "waiting"
+    ) {
+      await dispatchOrder(orderId, data);
+    }
+
+    if (status === "completed" || status === "cancelled") {
+      if (data.driverId) {
+        await rtdb.ref(`drivers_online/${data.driverId}`).update({
+          isBusy: false,
+          currentTrip: null,
+          currentRequest: null
+        });
+      }
+
+      await removeRequestFromAllDrivers(orderId);
+    }
+  }
+});
+
+/* =======================================================
+   🚕 GET RIDE OPTIONS
+======================================================= */
+app.post(
+  "/getRideOptions",
+  async (req, res) => {
+
+    try {
+
+      const body =
+        req.body || {};
+
+      const pickupLat =
+        Number(body.pickupLat);
+
+      const pickupLng =
+        Number(body.pickupLng);
+
+      const dropLat =
+        Number(body.dropLat);
+
+      const dropLng =
+        Number(body.dropLng);
+
+      const serviceType =
+        (body.serviceType || "ride").toLowerCase();
+
+      const tripKm = haversine(
+        pickupLat,
+        pickupLng,
+        dropLat,
+        dropLng
+      );
+
+      let categories = [];
+
+      if (serviceType === "ride") {
+        categories = ["economy", "comfort", "premium", "women", "aletwende", "xl", "xxl"];
+      }
+
+      if (serviceType === "courier" || serviceType === "package") {
+        categories = ["delivery_bicycle", "delivery_motorbike", "delivery_car"];
+      }
+
+      if (serviceType === "delivery") {
+        categories = ["delivery_bicycle", "delivery_motorbike", "delivery_car", "open_truck", "closed_truck"];
+      }
+
+      if (serviceType === "delivery_truck") {
+        categories = ["delivery_truck"];
+      }
+
+      const onlineSnap = await rtdb.ref("drivers_online").once("value");
+      const locationSnap = await rtdb.ref("driver_locations").once("value");
+
+      const online = onlineSnap.val() || {};
+      const locations = locationSnap.val() || {};
+
+      const driversSnap = await db.collection("drivers").get();
+
+      const drivers = [];
+
+      driversSnap.forEach((doc) => {
+        const d = doc.data() || {};
+        const uid = d.uid || doc.id;
+
+        if (!uid) return;
+        if (!online[uid]?.isOnline) return;
+        if (online[uid]?.isBusy) return;
+        if (!locations[uid]?.l) return;
+        if (!d.vehicle) return;
+
+        if (!d.vehicle.services.includes(serviceType)) return;
+
+        const lat = Number(locations[uid].l[0]);
+        const lng = Number(locations[uid].l[1]);
+
+        const distance = haversine(pickupLat, pickupLng, lat, lng);
+
+        if (distance > 7) return;
+
+        drivers.push({
+          uid,
+          distance,
+          vehicle: d.vehicle
+        });
+      });
+
+      const cards = [];
+
+      const DISPLAY_NAMES = {
+        delivery_car: "Car",
+        delivery_motorbike: "Motorbike",
+        delivery_bicycle: "Bicycle",
+        open_truck: "Open Truck",
+        closed_truck: "Closed Truck",
+        economy: "Economy",
+        comfort: "Comfort",
+        premium: "Premium",
+        xl: "XL",
+        xxl: "XXL"
+      };
+
+      for (const category of categories) {
+
+        const match = drivers.find(d =>
+          d.vehicle.vehicleCategory.includes(category)
+        );
+
+        if (!match) {
+          cards.push({
+            category,
+            title: DISPLAY_NAMES[category] || category,
+            enabled: false,
+            eta: null,
+            price: null,
+            seats: null,
+            image: `${category}.png`
+          });
+          continue;
+        }
+
+        const pricingKey =
+          match.vehicle.pricingCategory.find(p => p.includes(category)) ||
+          match.vehicle.pricingCategory[0];
+
+        const pricingDoc = await db.collection("pricing").doc(pricingKey).get();
+
+        let baseFare = 40;
+
+        if (pricingDoc.exists) {
+          baseFare = pricingDoc.data().baseFare || 40;
+        }
+
+        const eta = Math.max(2, Math.round(match.distance * 2));
+
+        const price = calculateFare(baseFare, tripKm);
+
+        cards.push({
+          category,
+          title: DISPLAY_NAMES[category] || category,
+          dispatchService: pricingKey,
+          pricingCategory: pricingKey,
+          enabled: true,
+          eta,
+          price,
+          seats: serviceType === "ride" ? (match.vehicle.maxSeats || 4) : null,
+          image: `${category}.png`
+        });
+      }
+
+      return res.json(cards);
+
+    } catch (error) {
+
+      return res.status(500).json({
+        error: error.message
+      });
+    }
   }
 );
+
+/* =======================================================
+   HOME
+======================================================= */
+app.get("/", (req, res) => {
+  res.send("Backend running 🚀");
+});
+
+/* =======================================================
+   START SERVER
+======================================================= */
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
