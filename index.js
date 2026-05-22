@@ -38,6 +38,494 @@ const now = () =>
   admin.firestore.FieldValue.serverTimestamp();
 
 /* =======================================================
+   🔥 RATING HELPER FUNCTIONS
+======================================================= */
+/**
+ * Calculate new weighted average rating
+ * @param {number} currentRating - Current average rating
+ * @param {number} currentReviewCount - Current number of reviews
+ * @param {number} newRating - New rating to add (1-5)
+ * @returns {number} - New weighted average rating
+ */
+function calculateNewAverageRating(currentRating, currentReviewCount, newRating) {
+  // Handle edge case when reviewCount is 0
+  if (currentReviewCount === 0) {
+    return newRating;
+  }
+  
+  // Weighted average formula: ((oldRating × oldReviewCount) + newRating) / newReviewCount
+  const newReviewCount = currentReviewCount + 1;
+  const totalRatingSum = (currentRating * currentReviewCount) + newRating;
+  const newAverage = totalRatingSum / newReviewCount;
+  
+  // Round to 2 decimal places for cleaner storage
+  return Math.round(newAverage * 100) / 100;
+}
+
+/**
+ * Validate rating value
+ * @param {number} rating - Rating to validate
+ * @returns {boolean} - True if valid
+ */
+function isValidRating(rating) {
+  return typeof rating === 'number' && rating >= 1 && rating <= 5;
+}
+
+/**
+ * Check if order has already been rated by user
+ * @param {string} orderId - Order ID
+ * @param {string} type - 'driver' or 'store'
+ * @returns {Promise<boolean>} - True if already rated
+ */
+async function isAlreadyRated(orderId, type) {
+  try {
+    const ratingDoc = await db
+      .collection("ratings")
+      .doc(orderId)
+      .get();
+    
+    if (ratingDoc.exists) {
+      const data = ratingDoc.data();
+      if (type === 'driver' && data.driverRated) return true;
+      if (type === 'store' && data.storeRated) return true;
+    }
+    return false;
+  } catch (error) {
+    console.log("isAlreadyRated error:", error);
+    return false;
+  }
+}
+
+/**
+ * Mark order as rated for specific type
+ * @param {string} orderId - Order ID
+ * @param {string} type - 'driver' or 'store'
+ * @param {Object} ratingData - Rating details to store
+ */
+async function markOrderAsRated(orderId, type, ratingData) {
+  try {
+    const ratingRef = db.collection("ratings").doc(orderId);
+    const ratingDoc = await ratingRef.get();
+    
+    const updateData = {};
+    if (type === 'driver') {
+      updateData.driverRated = true;
+      updateData.driverRating = ratingData.rating;
+      updateData.driverFeedback = ratingData.feedback || '';
+      updateData.driverRatedAt = now();
+    } else if (type === 'store') {
+      updateData.storeRated = true;
+      updateData.storeRating = ratingData.rating;
+      updateData.storeFeedback = ratingData.feedback || '';
+      updateData.storeRatedAt = now();
+    }
+    
+    updateData.updatedAt = now();
+    
+    if (ratingDoc.exists) {
+      await ratingRef.update(updateData);
+    } else {
+      await ratingRef.set({
+        orderId,
+        ...updateData,
+        createdAt: now()
+      });
+    }
+  } catch (error) {
+    console.log("markOrderAsRated error:", error);
+    throw error;
+  }
+}
+
+/* =======================================================
+   🔥 RATINGS ENDPOINTS
+======================================================= */
+
+/* =======================================================
+   POST /api/ratings/driver
+   Submit rating for a driver
+   Body: { driverId, orderId, rating, feedback }
+======================================================= */
+app.post("/api/ratings/driver", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const driverId = val(body.driverId);
+    const orderId = val(body.orderId);
+    const rating = Number(body.rating);
+    const feedback = val(body.feedback);
+
+    // Validation
+    if (!driverId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing driverId"
+      });
+    }
+
+    if (!orderId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing orderId"
+      });
+    }
+
+    if (!isValidRating(rating)) {
+      return res.status(400).json({
+        success: false,
+        error: "Rating must be a number between 1 and 5"
+      });
+    }
+
+    // Check if order exists
+    const orderRef = db.collection("orders").doc(orderId);
+    const orderDoc = await orderRef.get();
+    
+    if (!orderDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        error: "Order not found"
+      });
+    }
+
+    // Check if driver already rated for this order
+    const alreadyRated = await isAlreadyRated(orderId, 'driver');
+    if (alreadyRated) {
+      return res.status(400).json({
+        success: false,
+        error: "Driver already rated for this order"
+      });
+    }
+
+    // Get current driver document
+    const driverRef = db.collection("drivers").doc(driverId);
+    const driverDoc = await driverRef.get();
+
+    if (!driverDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        error: "Driver not found"
+      });
+    }
+
+    const driverData = driverDoc.data() || {};
+    let currentRating = driverData.rating || 0;
+    let currentReviewCount = driverData.reviewCount || 0;
+
+    // Calculate new average rating
+    const newRating = calculateNewAverageRating(currentRating, currentReviewCount, rating);
+    const newReviewCount = currentReviewCount + 1;
+
+    // Update driver document
+    await driverRef.update({
+      rating: newRating,
+      reviewCount: newReviewCount,
+      updatedAt: now()
+    });
+
+    // Store feedback in a subcollection (optional but good for analytics)
+    if (feedback && feedback.trim().length > 0) {
+      await driverRef.collection("reviews").add({
+        orderId,
+        rating,
+        feedback: feedback.trim(),
+        createdAt: now()
+      });
+    }
+
+    // Mark order as rated for driver
+    await markOrderAsRated(orderId, 'driver', { rating, feedback });
+
+    // Also update the order to indicate driver rating is complete
+    await orderRef.update({
+      driverRated: true,
+      driverRating: rating,
+      driverRatingSubmittedAt: now()
+    });
+
+    console.log(`Driver ${driverId} rated ${rating} for order ${orderId}. New avg: ${newRating} (${newReviewCount} reviews)`);
+
+    return res.json({
+      success: true,
+      data: {
+        driverId,
+        orderId,
+        rating,
+        newAverageRating: newRating,
+        totalReviews: newReviewCount
+      }
+    });
+
+  } catch (error) {
+    console.error("Error in /api/ratings/driver:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/* =======================================================
+   POST /api/ratings/store
+   Submit rating for a store
+   Body: { storeId, orderId, rating, feedback }
+======================================================= */
+app.post("/api/ratings/store", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const storeId = val(body.storeId);
+    const orderId = val(body.orderId);
+    const rating = Number(body.rating);
+    const feedback = val(body.feedback);
+
+    // Validation
+    if (!storeId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing storeId"
+      });
+    }
+
+    if (!orderId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing orderId"
+      });
+    }
+
+    if (!isValidRating(rating)) {
+      return res.status(400).json({
+        success: false,
+        error: "Rating must be a number between 1 and 5"
+      });
+    }
+
+    // Check if order exists
+    const orderRef = db.collection("orders").doc(orderId);
+    const orderDoc = await orderRef.get();
+    
+    if (!orderDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        error: "Order not found"
+      });
+    }
+
+    // Check if store already rated for this order
+    const alreadyRated = await isAlreadyRated(orderId, 'store');
+    if (alreadyRated) {
+      return res.status(400).json({
+        success: false,
+        error: "Store already rated for this order"
+      });
+    }
+
+    // Get current store document
+    const storeRef = db.collection("stores").doc(storeId);
+    const storeDoc = await storeRef.get();
+
+    if (!storeDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        error: "Store not found"
+      });
+    }
+
+    const storeData = storeDoc.data() || {};
+    let currentRating = storeData.rating || 0;
+    let currentReviewCount = storeData.reviewCount || 0;
+
+    // Calculate new average rating
+    const newRating = calculateNewAverageRating(currentRating, currentReviewCount, rating);
+    const newReviewCount = currentReviewCount + 1;
+
+    // Update store document
+    await storeRef.update({
+      rating: newRating,
+      reviewCount: newReviewCount,
+      updatedAt: now()
+    });
+
+    // Store feedback in a subcollection (optional but good for analytics)
+    if (feedback && feedback.trim().length > 0) {
+      await storeRef.collection("reviews").add({
+        orderId,
+        rating,
+        feedback: feedback.trim(),
+        createdAt: now()
+      });
+    }
+
+    // Mark order as rated for store
+    await markOrderAsRated(orderId, 'store', { rating, feedback });
+
+    // Also update the order to indicate store rating is complete
+    await orderRef.update({
+      storeRated: true,
+      storeRating: rating,
+      storeRatingSubmittedAt: now()
+    });
+
+    console.log(`Store ${storeId} rated ${rating} for order ${orderId}. New avg: ${newRating} (${newReviewCount} reviews)`);
+
+    return res.json({
+      success: true,
+      data: {
+        storeId,
+        orderId,
+        rating,
+        newAverageRating: newRating,
+        totalReviews: newReviewCount
+      }
+    });
+
+  } catch (error) {
+    console.error("Error in /api/ratings/store:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/* =======================================================
+   GET /api/ratings/driver/:driverId
+   Get driver's rating and review count
+======================================================= */
+app.get("/api/ratings/driver/:driverId", async (req, res) => {
+  try {
+    const driverId = req.params.driverId;
+    
+    if (!driverId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing driverId"
+      });
+    }
+
+    const driverDoc = await db.collection("drivers").doc(driverId).get();
+    
+    if (!driverDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        error: "Driver not found"
+      });
+    }
+
+    const driverData = driverDoc.data() || {};
+    
+    return res.json({
+      success: true,
+      data: {
+        driverId,
+        rating: driverData.rating || 0,
+        reviewCount: driverData.reviewCount || 0
+      }
+    });
+
+  } catch (error) {
+    console.error("Error in GET /api/ratings/driver/:driverId:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/* =======================================================
+   GET /api/ratings/store/:storeId
+   Get store's rating and review count
+======================================================= */
+app.get("/api/ratings/store/:storeId", async (req, res) => {
+  try {
+    const storeId = req.params.storeId;
+    
+    if (!storeId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing storeId"
+      });
+    }
+
+    const storeDoc = await db.collection("stores").doc(storeId).get();
+    
+    if (!storeDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        error: "Store not found"
+      });
+    }
+
+    const storeData = storeDoc.data() || {};
+    
+    return res.json({
+      success: true,
+      data: {
+        storeId,
+        rating: storeData.rating || 0,
+        reviewCount: storeData.reviewCount || 0
+      }
+    });
+
+  } catch (error) {
+    console.error("Error in GET /api/ratings/store/:storeId:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/* =======================================================
+   GET /api/ratings/check-order/:orderId
+   Check if an order has been rated
+======================================================= */
+app.get("/api/ratings/check-order/:orderId", async (req, res) => {
+  try {
+    const orderId = req.params.orderId;
+    
+    if (!orderId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing orderId"
+      });
+    }
+
+    const ratingDoc = await db.collection("ratings").doc(orderId).get();
+    
+    if (!ratingDoc.exists) {
+      return res.json({
+        success: true,
+        data: {
+          orderId,
+          driverRated: false,
+          storeRated: false
+        }
+      });
+    }
+
+    const data = ratingDoc.data();
+    
+    return res.json({
+      success: true,
+      data: {
+        orderId,
+        driverRated: data.driverRated || false,
+        storeRated: data.storeRated || false,
+        driverRating: data.driverRating || null,
+        storeRating: data.storeRating || null
+      }
+    });
+
+  } catch (error) {
+    console.error("Error in GET /api/ratings/check-order/:orderId:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/* =======================================================
    🔥 RTDB REQUEST STATUS SYNC
 ======================================================= */
 async function updateDriverRequestStatus(
