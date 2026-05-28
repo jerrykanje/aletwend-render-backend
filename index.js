@@ -1838,6 +1838,9 @@ async function sendRequestToDriver(
 /* =======================================================
    🔥 DISPATCH ORDER (MODIFIED WITH ROUTE DATA)
 ======================================================= */
+/* =======================================================
+   🔥 DISPATCH ORDER
+======================================================= */
 async function dispatchOrder(
   orderId,
   orderData
@@ -1889,14 +1892,6 @@ async function dispatchOrder(
         });
     }
 
-    // Calculate customer trip route (pickup -> destination)
-    const tripRouteData = await getRouteDataWithFallback(
-      Number(orderData.pickupLat),
-      Number(orderData.pickupLng),
-      Number(orderData.dropLat),
-      Number(orderData.dropLng)
-    );
-
     const matchedDriver =
       await findMatchingDriver(
         orderData
@@ -1918,48 +1913,28 @@ async function dispatchOrder(
       return;
     }
 
-    // Prepare routing data for order document
-    const routingData = {
-      tripDistanceKm: tripRouteData.distanceKm,
-      tripDurationMinutes: tripRouteData.durationMinutes,
-      tripGeometry: tripRouteData.geometry,
-      tripEncodedPolyline: tripRouteData.encodedPolyline,
-      driverToPickupDistanceKm: matchedDriver.driverToPickupDistanceKm || null,
-      driverToPickupEtaMinutes: matchedDriver.driverToPickupEtaMinutes || null,
-      driverToPickupGeometry: matchedDriver.driverToPickupGeometry || null,
-      driverToPickupEncodedPolyline: matchedDriver.driverToPickupEncodedPolyline || null
-    };
+    await db
+      .collection("orders")
+      .doc(orderId)
+      .update({
 
-// In dispatchOrder, update order doc — keep geometry here for client app ✅
-await db
-  .collection("orders")
-  .doc(orderId)
-  .update({
-    driverId: matchedDriver.uid,
-    distanceKm: tripRouteData.distanceKm,
-    durationMinutes: tripRouteData.durationMinutes,
-    encodedPolyline: tripRouteData.encodedPolyline,        // ✅ keep for client app
-    // routeGeometry: tripRouteData.geometry,              // optional — only if you need it
-    driverToPickupDistanceKm: matchedDriver.driverToPickupDistanceKm || null,
-    driverToPickupEtaMinutes: matchedDriver.driverToPickupEtaMinutes || null,
-    driverToPickupEncodedPolyline: matchedDriver.driverToPickupEncodedPolyline || null,
-    // driverToPickupGeometry: never needed in Firestore
-  });
+        driverId:
+          matchedDriver.uid
+      });
 
     await sendRequestToDriver(
 
       orderId,
 
       {
+
         ...orderData,
-        fare: orderData.fare,
-        vehicleCategory: orderData.vehicleCategory,
-        distanceKm: tripRouteData.distanceKm,
-        durationMinutes: tripRouteData.durationMinutes
+
+        driverStatus:
+          "searching"
       },
 
-      matchedDriver.uid,
-      routingData
+      matchedDriver.uid
     );
 
   } catch (error) {
