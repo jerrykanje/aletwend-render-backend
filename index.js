@@ -1803,30 +1803,34 @@ async function sendRequestToDriver(
       expiresAt:
         Date.now() + 30000,
 
-      // Explicit routing fields for driver app
+      // Flat routing fields for driver app — NO raw geometry arrays
       pickupLat: Number(orderData.pickupLat),
       pickupLng: Number(orderData.pickupLng),
       dropLat: Number(orderData.dropLat),
       dropLng: Number(orderData.dropLng),
       pickupAddress: val(orderData.pickupAddress),
       destinationAddress: val(orderData.destinationAddress),
-      
+
       tripDistanceKm: routingData.tripDistanceKm || null,
       tripEtaMinutes: routingData.tripEtaMinutes || null,
-      routeGeometry: routingData.routeGeometry || null,
+
+      // ✅ Encoded polyline only — compact string, safe for RTDB
       encodedPolyline: routingData.encodedPolyline || null,
-      
+
       driverToPickupDistanceKm: routingData.driverToPickupDistanceKm || null,
       driverToPickupEtaMinutes: routingData.driverToPickupEtaMinutes || null,
-      driverToPickupGeometry: routingData.driverToPickupGeometry || null,
+
+      // ✅ Encoded polyline only — compact string, safe for RTDB
       driverToPickupEncodedPolyline: routingData.driverToPickupEncodedPolyline || null,
-      
+
+      // ❌ REMOVED: routeGeometry — raw coordinate array, too large for RTDB
+      // ❌ REMOVED: driverToPickupGeometry — raw coordinate array, too large for RTDB
+
       vehicleCategory: val(orderData.vehicleCategory),
       dispatchService: val(orderData.dispatchService),
       fare: orderData.fare || null,
 
-      data:
-        orderData
+      data: orderData
     };
 
     await rtdb
@@ -1953,21 +1957,21 @@ async function dispatchOrder(
       driverToPickupEncodedPolyline: matchedDriver.driverToPickupEncodedPolyline || null
     };
 
-    // Update order document with complete routing data
-    await db
-      .collection("orders")
-      .doc(orderId)
-      .update({
-        driverId: matchedDriver.uid,
-        distanceKm: tripRouteData.distanceKm,
-        durationMinutes: tripRouteData.durationMinutes,
-        routeGeometry: tripRouteData.geometry,
-        encodedPolyline: tripRouteData.encodedPolyline,
-        driverToPickupDistanceKm: matchedDriver.driverToPickupDistanceKm || null,
-        driverToPickupEtaMinutes: matchedDriver.driverToPickupEtaMinutes || null,
-        driverToPickupGeometry: matchedDriver.driverToPickupGeometry || null,
-        driverToPickupEncodedPolyline: matchedDriver.driverToPickupEncodedPolyline || null
-      });
+// In dispatchOrder, update order doc — keep geometry here for client app ✅
+await db
+  .collection("orders")
+  .doc(orderId)
+  .update({
+    driverId: matchedDriver.uid,
+    distanceKm: tripRouteData.distanceKm,
+    durationMinutes: tripRouteData.durationMinutes,
+    encodedPolyline: tripRouteData.encodedPolyline,        // ✅ keep for client app
+    // routeGeometry: tripRouteData.geometry,              // optional — only if you need it
+    driverToPickupDistanceKm: matchedDriver.driverToPickupDistanceKm || null,
+    driverToPickupEtaMinutes: matchedDriver.driverToPickupEtaMinutes || null,
+    driverToPickupEncodedPolyline: matchedDriver.driverToPickupEncodedPolyline || null,
+    // driverToPickupGeometry: never needed in Firestore
+  });
 
     await sendRequestToDriver(
 
