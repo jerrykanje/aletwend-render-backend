@@ -1766,12 +1766,13 @@ async function findMatchingDriver(
 }
 
 /* =======================================================
-   🔥 SEND REQUEST TO DRIVER
+   🔥 SEND REQUEST TO DRIVER (MODIFIED WITH ROUTING DATA)
 ======================================================= */
 async function sendRequestToDriver(
   orderId,
   orderData,
-  driverUid
+  driverUid,
+  routingData = {}
 ) {
 
   try {
@@ -1802,8 +1803,34 @@ async function sendRequestToDriver(
       expiresAt:
         Date.now() + 30000,
 
-      data:
-        orderData
+      // Flat routing fields for driver app — NO raw geometry arrays
+      pickupLat: Number(orderData.pickupLat),
+      pickupLng: Number(orderData.pickupLng),
+      dropLat: Number(orderData.dropLat),
+      dropLng: Number(orderData.dropLng),
+      pickupAddress: val(orderData.pickupAddress),
+      destinationAddress: val(orderData.destinationAddress),
+
+      tripDistanceKm: routingData.tripDistanceKm || null,
+      tripEtaMinutes: routingData.tripEtaMinutes || null,
+
+      // ✅ Encoded polyline only — compact string, safe for RTDB
+      encodedPolyline: routingData.encodedPolyline || null,
+
+      driverToPickupDistanceKm: routingData.driverToPickupDistanceKm || null,
+      driverToPickupEtaMinutes: routingData.driverToPickupEtaMinutes || null,
+
+      // ✅ Encoded polyline only — compact string, safe for RTDB
+      driverToPickupEncodedPolyline: routingData.driverToPickupEncodedPolyline || null,
+
+      // ❌ REMOVED: routeGeometry — raw coordinate array, too large for RTDB
+      // ❌ REMOVED: driverToPickupGeometry — raw coordinate array, too large for RTDB
+
+      vehicleCategory: val(orderData.vehicleCategory),
+      dispatchService: val(orderData.dispatchService),
+      fare: orderData.fare || null,
+
+      data: orderData
     };
 
     await rtdb
@@ -1823,7 +1850,7 @@ async function sendRequestToDriver(
       });
 
     console.log(
-      `Request sent to driver ${driverUid}`
+      `Request sent to driver ${driverUid} with routing data`
     );
 
   } catch (error) {
@@ -1834,10 +1861,7 @@ async function sendRequestToDriver(
     );
   }
 }
-
-/* =======================================================
-   🔥 DISPATCH ORDER (MODIFIED WITH ROUTE DATA)
-======================================================= */
+ 
 /* =======================================================
    🔥 DISPATCH ORDER
 ======================================================= */
