@@ -1812,10 +1812,10 @@ async function sendRequestToDriver(
       destinationAddress: val(orderData.destinationAddress),
 
       tripDistanceKm: routingData.tripDistanceKm || null,
-      tripEtaMinutes: routingData.tripEtaMinutes || null,
+      tripEtaMinutes: routingData.tripDurationMinutes || null,      // fixed
 
       // ✅ Encoded polyline only — compact string, safe for RTDB
-      encodedPolyline: routingData.encodedPolyline || null,
+      encodedPolyline: routingData.tripEncodedPolyline || null,     // fixed
 
       driverToPickupDistanceKm: routingData.driverToPickupDistanceKm || null,
       driverToPickupEtaMinutes: routingData.driverToPickupEtaMinutes || null,
