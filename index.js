@@ -1,6 +1,8 @@
-  const express = require("express");
+ const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
+const axios = require("axios");
+const polyline = require("polyline");
 
 const app = express();
 
@@ -36,6 +38,96 @@ const val = (x) => x ?? "";
 
 const now = () =>
   admin.firestore.FieldValue.serverTimestamp();
+
+/* =======================================================
+   🗺️ ORS ROUTING HELPER FUNCTIONS (NEW)
+======================================================= */
+
+/**
+ * Get route data from OpenRouteService
+ * @param {number} startLat - Starting latitude
+ * @param {number} startLng - Starting longitude
+ * @param {number} endLat - Ending latitude
+ * @param {number} endLng - Ending longitude
+ * @returns {Promise<Object>} - Route data with distanceKm, durationMinutes, geometry
+ */
+async function getRouteData(startLat, startLng, endLat, endLng) {
+  try {
+    const ORS_API_KEY = process.env.ORS_API_KEY;
+    
+    if (!ORS_API_KEY) {
+      console.error("ORS_API_KEY not configured");
+      return null;
+    }
+
+    const url = "https://api.openrouteservice.org/v2/directions/driving-car/geojson";
+    
+    const response = await axios.post(
+      url,
+      {
+        coordinates: [
+          [startLng, startLat],
+          [endLng, endLat]
+        ]
+      },
+      {
+        headers: {
+          "Authorization": ORS_API_KEY,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+
+    if (response.data && response.data.features && response.data.features[0]) {
+      const feature = response.data.features[0];
+      const properties = feature.properties;
+      const summary = properties.summary;
+      
+      const distanceKm = summary.distance / 1000;
+      const durationMinutes = summary.duration / 60;
+      const geometry = feature.geometry.coordinates;
+      
+      return {
+        distanceKm: Math.round(distanceKm * 10) / 10,
+        durationMinutes: Math.round(durationMinutes),
+        geometry: geometry,
+        encodedPolyline: polyline.encode(geometry.map(coord => [coord[1], coord[0]]))
+      };
+    }
+    
+    return null;
+  } catch (error) {
+    console.error("getRouteData error:", error.message);
+    return null;
+  }
+}
+
+/**
+ * Get route data with fallback to haversine if ORS fails
+ * @param {number} startLat - Starting latitude
+ * @param {number} startLng - Starting longitude
+ * @param {number} endLat - Ending latitude
+ * @param {number} endLng - Ending longitude
+ * @returns {Promise<Object>} - Route data with fallback values
+ */
+async function getRouteDataWithFallback(startLat, startLng, endLat, endLng) {
+  const orsData = await getRouteData(startLat, startLng, endLat, endLng);
+  
+  if (orsData) {
+    return orsData;
+  }
+  
+  // Fallback to haversine calculation
+  const distanceKm = haversine(startLat, startLng, endLat, endLng);
+  const durationMinutes = Math.max(2, Math.round(distanceKm * 2));
+  
+  return {
+    distanceKm: Math.round(distanceKm * 10) / 10,
+    durationMinutes: durationMinutes,
+    geometry: null,
+    encodedPolyline: null
+  };
+}
 
 /* =======================================================
    🔥 RATING HELPER FUNCTIONS
@@ -518,6 +610,42 @@ app.get("/api/ratings/check-order/:orderId", async (req, res) => {
 
   } catch (error) {
     console.error("Error in GET /api/ratings/check-order/:orderId:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/* =======================================================
+   🗺️ NEW ENDPOINT: GET ROUTE
+   POST /getRoute
+   Body: { startLat, startLng, endLat, endLng }
+======================================================= */
+app.post("/getRoute", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const startLat = Number(body.startLat);
+    const startLng = Number(body.startLng);
+    const endLat = Number(body.endLat);
+    const endLng = Number(body.endLng);
+
+    if (isNaN(startLat) || isNaN(startLng) || isNaN(endLat) || isNaN(endLng)) {
+      return res.status(400).json({
+        success: false,
+        error: "Invalid coordinates"
+      });
+    }
+
+    const routeData = await getRouteDataWithFallback(startLat, startLng, endLat, endLng);
+
+    return res.json({
+      success: true,
+      data: routeData
+    });
+
+  } catch (error) {
+    console.error("Error in /getRoute:", error);
     return res.status(500).json({
       success: false,
       error: error.message
@@ -1390,7 +1518,7 @@ function calculateFare(
 }
 
 /* =======================================================
-   🔥 FIND MATCHING DRIVER
+   🔥 FIND MATCHING DRIVER (MODIFIED WITH ORS)
 ======================================================= */
 async function findMatchingDriver(
   orderData
@@ -1540,18 +1668,91 @@ async function findMatchingDriver(
 
           uid,
 
-          distance
+          distance,
+          driverLat: lat,
+          driverLng: lng
         });
       }
     );
 
+    // Sort by haversine distance and take top 5 for ORS refinement
     matches.sort(
       (a, b) =>
         a.distance -
         b.distance
     );
-
-    return matches[0] || null;
+    
+    const topCandidates = matches.slice(0, 5);
+    
+    // Refine top candidates with ORS road distance
+    const refinedMatches = [];
+    
+    for (const candidate of topCandidates) {
+      try {
+        const routeData = await getRouteData(
+          candidate.driverLat,
+          candidate.driverLng,
+          pickupLat,
+          pickupLng
+        );
+        
+        if (routeData) {
+          refinedMatches.push({
+            uid: candidate.uid,
+            distance: routeData.distanceKm,
+            originalHaversineDistance: candidate.distance,
+            driverToPickupDistanceKm: routeData.distanceKm,
+            driverToPickupEtaMinutes: routeData.durationMinutes,
+            driverToPickupGeometry: routeData.geometry,
+            driverToPickupEncodedPolyline: routeData.encodedPolyline
+          });
+        } else {
+          // Fallback to haversine if ORS fails
+          refinedMatches.push({
+            uid: candidate.uid,
+            distance: candidate.distance,
+            originalHaversineDistance: candidate.distance,
+            driverToPickupDistanceKm: candidate.distance,
+            driverToPickupEtaMinutes: Math.max(2, Math.round(candidate.distance * 2)),
+            driverToPickupGeometry: null,
+            driverToPickupEncodedPolyline: null
+          });
+        }
+      } catch (error) {
+        console.log(`ORS failed for candidate ${candidate.uid}:`, error);
+        refinedMatches.push({
+          uid: candidate.uid,
+          distance: candidate.distance,
+          originalHaversineDistance: candidate.distance,
+          driverToPickupDistanceKm: candidate.distance,
+          driverToPickupEtaMinutes: Math.max(2, Math.round(candidate.distance * 2)),
+          driverToPickupGeometry: null,
+          driverToPickupEncodedPolyline: null
+        });
+      }
+    }
+    
+    // Sort refined matches by actual road distance
+    refinedMatches.sort(
+      (a, b) =>
+        a.driverToPickupDistanceKm -
+        b.driverToPickupDistanceKm
+    );
+    
+    const bestMatch = refinedMatches[0] || null;
+    
+    if (bestMatch) {
+      return {
+        uid: bestMatch.uid,
+        distance: bestMatch.driverToPickupDistanceKm,
+        driverToPickupDistanceKm: bestMatch.driverToPickupDistanceKm,
+        driverToPickupEtaMinutes: bestMatch.driverToPickupEtaMinutes,
+        driverToPickupGeometry: bestMatch.driverToPickupGeometry,
+        driverToPickupEncodedPolyline: bestMatch.driverToPickupEncodedPolyline
+      };
+    }
+    
+    return null;
 
   } catch (error) {
 
@@ -1565,12 +1766,13 @@ async function findMatchingDriver(
 }
 
 /* =======================================================
-   🔥 SEND REQUEST TO DRIVER
+   🔥 SEND REQUEST TO DRIVER (MODIFIED – GEOMETRY FIELDS REMOVED)
 ======================================================= */
 async function sendRequestToDriver(
   orderId,
   orderData,
-  driverUid
+  driverUid,
+  routingData = {}
 ) {
 
   try {
@@ -1601,6 +1803,28 @@ async function sendRequestToDriver(
       expiresAt:
         Date.now() + 30000,
 
+      // Explicit routing fields for driver app
+      pickupLat: Number(orderData.pickupLat),
+      pickupLng: Number(orderData.pickupLng),
+      dropLat: Number(orderData.dropLat),
+      dropLng: Number(orderData.dropLng),
+      pickupAddress: val(orderData.pickupAddress),
+      destinationAddress: val(orderData.destinationAddress),
+      
+      tripDistanceKm: routingData.tripDistanceKm || null,
+      tripEtaMinutes: routingData.tripEtaMinutes || null,
+      // REMOVED: routeGeometry (too large for RTDB)
+      encodedPolyline: routingData.encodedPolyline || null,
+      
+      driverToPickupDistanceKm: routingData.driverToPickupDistanceKm || null,
+      driverToPickupEtaMinutes: routingData.driverToPickupEtaMinutes || null,
+      // REMOVED: driverToPickupGeometry (too large for RTDB)
+      driverToPickupEncodedPolyline: routingData.driverToPickupEncodedPolyline || null,
+      
+      vehicleCategory: val(orderData.vehicleCategory),
+      dispatchService: val(orderData.dispatchService),
+      fare: orderData.fare || null,
+
       data:
         orderData
     };
@@ -1622,7 +1846,7 @@ async function sendRequestToDriver(
       });
 
     console.log(
-      `Request sent to driver ${driverUid}`
+      `Request sent to driver ${driverUid} with routing data (geometry omitted)`
     );
 
   } catch (error) {
@@ -1635,7 +1859,7 @@ async function sendRequestToDriver(
 }
 
 /* =======================================================
-   🔥 DISPATCH ORDER
+   🔥 DISPATCH ORDER (MODIFIED WITH ROUTE DATA)
 ======================================================= */
 async function dispatchOrder(
   orderId,
@@ -1688,6 +1912,14 @@ async function dispatchOrder(
         });
     }
 
+    // Calculate customer trip route (pickup -> destination)
+    const tripRouteData = await getRouteDataWithFallback(
+      Number(orderData.pickupLat),
+      Number(orderData.pickupLng),
+      Number(orderData.dropLat),
+      Number(orderData.dropLng)
+    );
+
     const matchedDriver =
       await findMatchingDriver(
         orderData
@@ -1709,13 +1941,32 @@ async function dispatchOrder(
       return;
     }
 
+    // Prepare routing data for order document (Firestore can handle geometry arrays)
+    const routingData = {
+      tripDistanceKm: tripRouteData.distanceKm,
+      tripDurationMinutes: tripRouteData.durationMinutes,
+      tripGeometry: tripRouteData.geometry,
+      tripEncodedPolyline: tripRouteData.encodedPolyline,
+      driverToPickupDistanceKm: matchedDriver.driverToPickupDistanceKm || null,
+      driverToPickupEtaMinutes: matchedDriver.driverToPickupEtaMinutes || null,
+      driverToPickupGeometry: matchedDriver.driverToPickupGeometry || null,
+      driverToPickupEncodedPolyline: matchedDriver.driverToPickupEncodedPolyline || null
+    };
+
+    // Update order document with complete routing data (including geometry for Firestore)
     await db
       .collection("orders")
       .doc(orderId)
       .update({
-
-        driverId:
-          matchedDriver.uid
+        driverId: matchedDriver.uid,
+        distanceKm: tripRouteData.distanceKm,
+        durationMinutes: tripRouteData.durationMinutes,
+        routeGeometry: tripRouteData.geometry,
+        encodedPolyline: tripRouteData.encodedPolyline,
+        driverToPickupDistanceKm: matchedDriver.driverToPickupDistanceKm || null,
+        driverToPickupEtaMinutes: matchedDriver.driverToPickupEtaMinutes || null,
+        driverToPickupGeometry: matchedDriver.driverToPickupGeometry || null,
+        driverToPickupEncodedPolyline: matchedDriver.driverToPickupEncodedPolyline || null
       });
 
     await sendRequestToDriver(
@@ -1723,14 +1974,15 @@ async function dispatchOrder(
       orderId,
 
       {
-
         ...orderData,
-
-        driverStatus:
-          "searching"
+        fare: orderData.fare,
+        vehicleCategory: orderData.vehicleCategory,
+        distanceKm: tripRouteData.distanceKm,
+        durationMinutes: tripRouteData.durationMinutes
       },
 
-      matchedDriver.uid
+      matchedDriver.uid,
+      routingData
     );
 
   } catch (error) {
@@ -2540,7 +2792,7 @@ db.collection("orders")
   );
 
 /* =======================================================
-   🚕 GET RIDE OPTIONS
+   🚕 GET RIDE OPTIONS (MODIFIED WITH ORS)
 ======================================================= */
 app.post(
   "/getRideOptions",
@@ -2577,17 +2829,18 @@ app.post(
           "ride"
         ).toLowerCase();
 
-      const tripKm =
-        haversine(
-
-          pickupLat,
-
-          pickupLng,
-
-          dropLat,
-
-          dropLng
-        );
+      // Get actual road route data for the trip
+      const tripRoute = await getRouteDataWithFallback(
+        pickupLat,
+        pickupLng,
+        dropLat,
+        dropLng
+      );
+      
+      const tripKm = tripRoute.distanceKm;
+      const tripDurationMinutes = tripRoute.durationMinutes;
+      const tripGeometry = tripRoute.geometry;
+      const tripEncodedPolyline = tripRoute.encodedPolyline;
 
       let categories =
         [];
@@ -2854,7 +3107,13 @@ app.post(
               null,
 
             image:
-              `${category}.png`
+              `${category}.png`,
+
+            // NEW: Return routing data even for disabled options
+            distanceKm: null,
+            durationMinutes: null,
+            routeGeometry: null,
+            encodedPolyline: null
           });
 
           continue;
@@ -2895,21 +3154,16 @@ app.post(
               .baseFare || 40;
         }
 
-        const eta =
-          Math.max(
+        // Calculate driver ETA to pickup using haversine (quick estimate)
+        const driverEtaMinutes = Math.max(
+          2,
+          Math.round(match.distance * 2)
+        );
 
-            2,
-
-            Math.round(
-              match.distance * 2
-            )
-          );
-
+        // Calculate price using actual road distance from ORS
         const price =
           calculateFare(
-
             baseFare,
-
             tripKm
           );
 
@@ -2931,7 +3185,7 @@ app.post(
           enabled:
             true,
 
-          eta,
+          eta: driverEtaMinutes,
 
           price,
 
@@ -2947,7 +3201,13 @@ app.post(
               : null,
 
           image:
-            `${category}.png`
+            `${category}.png`,
+
+          // NEW: Return actual routing data from ORS
+          distanceKm: tripKm,
+          durationMinutes: tripDurationMinutes,
+          routeGeometry: tripGeometry,
+          encodedPolyline: tripEncodedPolyline
         });
       }
 
@@ -2957,6 +3217,8 @@ app.post(
 
     } catch (error) {
 
+      console.error("Error in /getRideOptions:", error);
+      
       return res
         .status(500)
         .json({
@@ -2976,7 +3238,7 @@ app.get(
   (req, res) => {
 
     res.send(
-      "Backend running 🚀"
+      "Backend running 🚀 with ORS routing"
     );
   }
 );
