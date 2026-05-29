@@ -1768,97 +1768,92 @@ async function findMatchingDriver(
 /* =======================================================
    🔥 SEND REQUEST TO DRIVER (MODIFIED WITH ROUTING DATA)
 ======================================================= */
-async function sendRequestToDriver(
-  orderId,
-  orderData,
-  driverUid,
-  routingData = {}
-) {
-
+async function dispatchOrder(orderId, orderData) {
   try {
+    const workflowType = val(orderData.workflowType);
 
-    const workflowType =
-      val(
-        orderData.workflowType
-      );
+    if (workflowType === "direct_trip") {
+      await db.collection("orders").doc(orderId).update({
+        driverStatus: "searching",
+        dispatchStartedAt: now()
+      });
+    }
 
-    const payload = {
+    if (workflowType === "store_delivery" || workflowType === "delivery") {
+      await db.collection("orders").doc(orderId).update({
+        driverStatus: "searching",
+        dispatchStartedAt: now()
+      });
+    }
 
-      orderId,
+    // Find driver first — this is the critical path
+    const matchedDriver = await findMatchingDriver(orderData);
 
-      workflowType,
+    if (!matchedDriver) {
+      await db.collection("orders").doc(orderId).update({
+        driverStatus: "no_driver_found"
+      });
+      return;
+    }
 
-      requestType:
-        workflowType,
-
-      status:
-        "incoming_request",
-
-      createdAt:
-        admin
-          .database
-          .ServerValue
-          .TIMESTAMP,
-
-      expiresAt:
-        Date.now() + 30000,
-
-      // Flat routing fields for driver app — NO raw geometry arrays
-      pickupLat: Number(orderData.pickupLat),
-      pickupLng: Number(orderData.pickupLng),
-      dropLat: Number(orderData.dropLat),
-      dropLng: Number(orderData.dropLng),
-      pickupAddress: val(orderData.pickupAddress),
-      destinationAddress: val(orderData.destinationAddress),
-
-      tripDistanceKm: routingData.tripDistanceKm || null,
-      tripEtaMinutes: routingData.tripDurationMinutes || null,      // fixed
-
-      // ✅ Encoded polyline only — compact string, safe for RTDB
-      encodedPolyline: routingData.tripEncodedPolyline || null,     // fixed
-
-      driverToPickupDistanceKm: routingData.driverToPickupDistanceKm || null,
-      driverToPickupEtaMinutes: routingData.driverToPickupEtaMinutes || null,
-
-      // ✅ Encoded polyline only — compact string, safe for RTDB
-      driverToPickupEncodedPolyline: routingData.driverToPickupEncodedPolyline || null,
-
-      // ❌ REMOVED: routeGeometry — raw coordinate array, too large for RTDB
-      // ❌ REMOVED: driverToPickupGeometry — raw coordinate array, too large for RTDB
-
-      vehicleCategory: val(orderData.vehicleCategory),
-      dispatchService: val(orderData.dispatchService),
-      fare: orderData.fare || null,
-
-      data: orderData
+    // Get trip route — wrapped in its own try/catch
+    // so a failure here NEVER blocks sendRequestToDriver
+    let tripRouteData = {
+      distanceKm: null,
+      durationMinutes: null,
+      encodedPolyline: null
     };
 
-    await rtdb
-      .ref(
-        `driver_trip_requests/${driverUid}/${orderId}`
-      )
-      .set(payload);
+    try {
+      const result = await getRouteDataWithFallback(
+        Number(orderData.pickupLat),
+        Number(orderData.pickupLng),
+        Number(orderData.dropLat),
+        Number(orderData.dropLng)
+      );
+      if (result) tripRouteData = result;
+    } catch (routeError) {
+      console.log("tripRoute fetch failed, continuing without it:", routeError);
+    }
 
-    await rtdb
-      .ref(
-        `drivers_online/${driverUid}`
-      )
-      .update({
+    const routingData = {
+      tripDistanceKm: tripRouteData.distanceKm,
+      tripDurationMinutes: tripRouteData.durationMinutes,
+      tripEncodedPolyline: tripRouteData.encodedPolyline,
+      driverToPickupDistanceKm: matchedDriver.driverToPickupDistanceKm || null,
+      driverToPickupEtaMinutes: matchedDriver.driverToPickupEtaMinutes || null,
+      driverToPickupEncodedPolyline: matchedDriver.driverToPickupEncodedPolyline || null
+    };
 
-        currentRequest:
-          orderId
+    // Update Firestore — also wrapped so it never blocks driver notification
+    try {
+      await db.collection("orders").doc(orderId).update({
+        driverId: matchedDriver.uid,
+        distanceKm: tripRouteData.distanceKm,
+        durationMinutes: tripRouteData.durationMinutes,
+        encodedPolyline: tripRouteData.encodedPolyline,
+        driverToPickupDistanceKm: matchedDriver.driverToPickupDistanceKm || null,
+        driverToPickupEtaMinutes: matchedDriver.driverToPickupEtaMinutes || null,
+        driverToPickupEncodedPolyline: matchedDriver.driverToPickupEncodedPolyline || null
       });
+    } catch (fsError) {
+      console.log("Firestore routing update failed, continuing:", fsError);
+      // Still update driverId at minimum
+      await db.collection("orders").doc(orderId).update({
+        driverId: matchedDriver.uid
+      });
+    }
 
-    console.log(
-      `Request sent to driver ${driverUid} with routing data`
+    // This ALWAYS runs regardless of what happened above
+    await sendRequestToDriver(
+      orderId,
+      { ...orderData, driverStatus: "searching" },
+      matchedDriver.uid,
+      routingData
     );
 
   } catch (error) {
-
-    console.log(
-      "sendRequestToDriver error",
-      error
-    );
+    console.log("dispatchOrder error", error);
   }
 }
  
