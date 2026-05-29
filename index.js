@@ -1,4 +1,4 @@
- const express = require("express");
+const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 const axios = require("axios");
@@ -1863,110 +1863,79 @@ async function sendRequestToDriver(
 }
  
 /* =======================================================
-   🔥 DISPATCH ORDER
+   🔥 DISPATCH ORDER (CORRECTED — routingData passed)
 ======================================================= */
-async function dispatchOrder(
-  orderId,
-  orderData
-) {
-
+async function dispatchOrder(orderId, orderData) {
   try {
+    const workflowType = val(orderData.workflowType);
 
-    const workflowType =
-      val(
-        orderData.workflowType
-      );
-
-    if (
-      workflowType ===
-      "direct_trip"
-    ) {
-
-      await db
-        .collection("orders")
-        .doc(orderId)
-        .update({
-
-          driverStatus:
-            "searching",
-
-          dispatchStartedAt:
-            now()
-        });
+    if (workflowType === "direct_trip") {
+      await db.collection("orders").doc(orderId).update({
+        driverStatus: "searching",
+        dispatchStartedAt: now()
+      });
     }
 
-    if (
-      workflowType ===
-      "store_delivery" ||
-
-      workflowType ===
-      "delivery"
-    ) {
-
-      await db
-        .collection("orders")
-        .doc(orderId)
-        .update({
-
-          driverStatus:
-            "searching",
-
-          dispatchStartedAt:
-            now()
-        });
+    if (workflowType === "store_delivery" || workflowType === "delivery") {
+      await db.collection("orders").doc(orderId).update({
+        driverStatus: "searching",
+        dispatchStartedAt: now()
+      });
     }
 
-    const matchedDriver =
-      await findMatchingDriver(
-        orderData
-      );
+    // Step 1: Get trip route (pickup → destination)
+    const tripRouteData = await getRouteDataWithFallback(
+      Number(orderData.pickupLat),
+      Number(orderData.pickupLng),
+      Number(orderData.dropLat),
+      Number(orderData.dropLng)
+    );
 
-    if (
-      !matchedDriver
-    ) {
+    // Step 2: Find best matching driver (also gets driver → pickup route)
+    const matchedDriver = await findMatchingDriver(orderData);
 
-      await db
-        .collection("orders")
-        .doc(orderId)
-        .update({
-
-          driverStatus:
-            "no_driver_found"
-        });
-
+    if (!matchedDriver) {
+      await db.collection("orders").doc(orderId).update({
+        driverStatus: "no_driver_found"
+      });
       return;
     }
 
-    await db
-      .collection("orders")
-      .doc(orderId)
-      .update({
+    // Step 3: Build routingData object — key names must match
+    // what sendRequestToDriver reads (tripEncodedPolyline, tripDurationMinutes)
+    const routingData = {
+      tripDistanceKm: tripRouteData.distanceKm,
+      tripDurationMinutes: tripRouteData.durationMinutes,
+      tripEncodedPolyline: tripRouteData.encodedPolyline,
+      driverToPickupDistanceKm: matchedDriver.driverToPickupDistanceKm || null,
+      driverToPickupEtaMinutes: matchedDriver.driverToPickupEtaMinutes || null,
+      driverToPickupEncodedPolyline: matchedDriver.driverToPickupEncodedPolyline || null
+    };
 
-        driverId:
-          matchedDriver.uid
-      });
+    // Step 4: Save routing fields to Firestore order doc for client app
+    await db.collection("orders").doc(orderId).update({
+      driverId: matchedDriver.uid,
+      distanceKm: tripRouteData.distanceKm,
+      durationMinutes: tripRouteData.durationMinutes,
+      encodedPolyline: tripRouteData.encodedPolyline,
+      driverToPickupDistanceKm: matchedDriver.driverToPickupDistanceKm || null,
+      driverToPickupEtaMinutes: matchedDriver.driverToPickupEtaMinutes || null,
+      driverToPickupEncodedPolyline: matchedDriver.driverToPickupEncodedPolyline || null
+    });
 
+    // Step 5: Send request to driver with full routing data
     await sendRequestToDriver(
-
       orderId,
-
       {
-
         ...orderData,
-
-        driverStatus:
-          "searching"
+        driverStatus: "searching"
       },
-
-      matchedDriver.uid
+      matchedDriver.uid,
+      routingData  // ← this is what was missing before
     );
 
   } catch (error) {
-
-    console.log(
-      "dispatchOrder error",
-      error
-    );
+    console.log("dispatchOrder error", error);
   }
 }
 
