@@ -1,4 +1,4 @@
-const express = require("express");
+ const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 const axios = require("axios");
@@ -40,90 +40,89 @@ const now = () =>
   admin.firestore.FieldValue.serverTimestamp();
 
 /* =======================================================
-   🗺️ ORS ROUTING HELPER FUNCTIONS (NEW)
+   🗺️ ORS ROUTING HELPER FUNCTIONS (FIX 1 APPLIED)
 ======================================================= */
 
 /**
- * Get route data from OpenRouteService
+ * Get route data from OpenRouteService with optional stops
  * @param {number} startLat - Starting latitude
  * @param {number} startLng - Starting longitude
  * @param {number} endLat - Ending latitude
  * @param {number} endLng - Ending longitude
+ * @param {Array} stops - Optional array of {lat, lng} waypoints
  * @returns {Promise<Object>} - Route data with distanceKm, durationMinutes, geometry
  */
-async function getRouteData(startLat, startLng, endLat, endLng) {
+async function getRouteData(startLat, startLng, endLat, endLng, stops = []) {
   try {
     const ORS_API_KEY = process.env.ORS_API_KEY;
-    
     if (!ORS_API_KEY) {
       console.error("ORS_API_KEY not configured");
       return null;
     }
 
-    const url = "https://api.openrouteservice.org/v2/directions/driving-car/geojson";
-    
+    // Build coordinates: pickup → valid stops → destination
+    const validStops = (stops || []).filter(
+      s => s && s.lat && s.lng && Number(s.lat) !== 0 && Number(s.lng) !== 0
+    );
+
+    const coordinates = [
+      [startLng, startLat],
+      ...validStops.map(s => [Number(s.lng), Number(s.lat)]),
+      [endLng, endLat]
+    ];
+
     const response = await axios.post(
-      url,
-      {
-        coordinates: [
-          [startLng, startLat],
-          [endLng, endLat]
-        ]
-      },
+      "https://api.openrouteservice.org/v2/directions/driving-car/geojson",
+      { coordinates },
       {
         headers: {
           "Authorization": ORS_API_KEY,
           "Content-Type": "application/json"
-        }
+        },
+        timeout: 8000
       }
     );
 
     if (response.data && response.data.features && response.data.features[0]) {
       const feature = response.data.features[0];
-      const properties = feature.properties;
-      const summary = properties.summary;
-      
-      const distanceKm = summary.distance / 1000;
-      const durationMinutes = summary.duration / 60;
-      const geometry = feature.geometry.coordinates;
-      
+      const summary = feature.properties.summary;
+      const geometry = feature.geometry.coordinates; // [lng, lat] pairs from ORS
+
+      // polyline.encode expects [[lat, lng], ...]
+      const latLngPairs = geometry.map(coord => [coord[1], coord[0]]);
+      const encoded = polyline.encode(latLngPairs);
+
+      console.log(`ORS success: ${Math.round(summary.distance / 1000 * 10) / 10}km, polyline length: ${encoded?.length}`);
+
       return {
-        distanceKm: Math.round(distanceKm * 10) / 10,
-        durationMinutes: Math.round(durationMinutes),
-        geometry: geometry,
-        encodedPolyline: polyline.encode(geometry.map(coord => [coord[1], coord[0]]))
+        distanceKm: Math.round(summary.distance / 100) / 10,
+        durationMinutes: Math.round(summary.duration / 60),
+        geometry,
+        encodedPolyline: encoded || null
       };
     }
-    
+
     return null;
   } catch (error) {
-    console.error("getRouteData error:", error.message);
+    console.error("getRouteData error:", error.response?.status, error.response?.data?.error?.message || error.message);
     return null;
   }
 }
 
 /**
  * Get route data with fallback to haversine if ORS fails
- * @param {number} startLat - Starting latitude
- * @param {number} startLng - Starting longitude
- * @param {number} endLat - Ending latitude
- * @param {number} endLng - Ending longitude
- * @returns {Promise<Object>} - Route data with fallback values
+ * Now passes stops through
  */
-async function getRouteDataWithFallback(startLat, startLng, endLat, endLng) {
-  const orsData = await getRouteData(startLat, startLng, endLat, endLng);
-  
-  if (orsData) {
-    return orsData;
-  }
-  
-  // Fallback to haversine calculation
+async function getRouteDataWithFallback(startLat, startLng, endLat, endLng, stops = []) {
+  const orsData = await getRouteData(startLat, startLng, endLat, endLng, stops);
+  if (orsData) return orsData;
+
+  // Fallback to haversine (no polyline available)
   const distanceKm = haversine(startLat, startLng, endLat, endLng);
   const durationMinutes = Math.max(2, Math.round(distanceKm * 2));
-  
   return {
     distanceKm: Math.round(distanceKm * 10) / 10,
-    durationMinutes: durationMinutes,
+    durationMinutes,
     geometry: null,
     encodedPolyline: null
   };
@@ -1518,7 +1517,7 @@ function calculateFare(
 }
 
 /* =======================================================
-   🔥 FIND MATCHING DRIVER (MODIFIED WITH ORS)
+   🔥 FIND MATCHING DRIVER (FIX 3: PARALLEL ORS)
 ======================================================= */
 async function findMatchingDriver(
   orderData
@@ -1684,61 +1683,38 @@ async function findMatchingDriver(
     
     const topCandidates = matches.slice(0, 5);
     
-    // Refine top candidates with ORS road distance
-    const refinedMatches = [];
-    
-    for (const candidate of topCandidates) {
-      try {
-        const routeData = await getRouteData(
-          candidate.driverLat,
-          candidate.driverLng,
-          pickupLat,
-          pickupLng
-        );
-        
-        if (routeData) {
-          refinedMatches.push({
-            uid: candidate.uid,
-            distance: routeData.distanceKm,
-            originalHaversineDistance: candidate.distance,
-            driverToPickupDistanceKm: routeData.distanceKm,
-            driverToPickupEtaMinutes: routeData.durationMinutes,
-            driverToPickupGeometry: routeData.geometry,
-            driverToPickupEncodedPolyline: routeData.encodedPolyline
-          });
-        } else {
-          // Fallback to haversine if ORS fails
-          refinedMatches.push({
-            uid: candidate.uid,
-            distance: candidate.distance,
-            originalHaversineDistance: candidate.distance,
-            driverToPickupDistanceKm: candidate.distance,
-            driverToPickupEtaMinutes: Math.max(2, Math.round(candidate.distance * 2)),
-            driverToPickupGeometry: null,
-            driverToPickupEncodedPolyline: null
-          });
+    // Parallel ORS calls for refined driver→pickup routes
+    const refinedMatches = await Promise.all(
+      topCandidates.map(async (candidate) => {
+        try {
+          const routeData = await getRouteData(
+            candidate.driverLat, candidate.driverLng,
+            pickupLat, pickupLng
+          );
+          if (routeData) {
+            return {
+              uid: candidate.uid,
+              distance: routeData.distanceKm,
+              driverToPickupDistanceKm: routeData.distanceKm,
+              driverToPickupEtaMinutes: routeData.durationMinutes,
+              driverToPickupEncodedPolyline: routeData.encodedPolyline
+            };
+          }
+        } catch (e) {
+          console.log(`ORS failed for candidate ${candidate.uid}:`, e.message);
         }
-      } catch (error) {
-        console.log(`ORS failed for candidate ${candidate.uid}:`, error);
-        refinedMatches.push({
+        // Fallback to haversine
+        return {
           uid: candidate.uid,
           distance: candidate.distance,
-          originalHaversineDistance: candidate.distance,
           driverToPickupDistanceKm: candidate.distance,
           driverToPickupEtaMinutes: Math.max(2, Math.round(candidate.distance * 2)),
-          driverToPickupGeometry: null,
           driverToPickupEncodedPolyline: null
-        });
-      }
-    }
-    
-    // Sort refined matches by actual road distance
-    refinedMatches.sort(
-      (a, b) =>
-        a.driverToPickupDistanceKm -
-        b.driverToPickupDistanceKm
+        };
+      })
     );
-    
+
+    refinedMatches.sort((a, b) => a.driverToPickupDistanceKm - b.driverToPickupDistanceKm);
     const bestMatch = refinedMatches[0] || null;
     
     if (bestMatch) {
@@ -1747,7 +1723,6 @@ async function findMatchingDriver(
         distance: bestMatch.driverToPickupDistanceKm,
         driverToPickupDistanceKm: bestMatch.driverToPickupDistanceKm,
         driverToPickupEtaMinutes: bestMatch.driverToPickupEtaMinutes,
-        driverToPickupGeometry: bestMatch.driverToPickupGeometry,
         driverToPickupEncodedPolyline: bestMatch.driverToPickupEncodedPolyline
       };
     }
@@ -1812,19 +1787,13 @@ async function sendRequestToDriver(
       destinationAddress: val(orderData.destinationAddress),
 
       tripDistanceKm: routingData.tripDistanceKm || null,
-      tripEtaMinutes: routingData.tripDurationMinutes || null,      // fixed
+      tripEtaMinutes: routingData.tripDurationMinutes || null,
 
-      // ✅ Encoded polyline only — compact string, safe for RTDB
-      encodedPolyline: routingData.tripEncodedPolyline || null,     // fixed
+      encodedPolyline: routingData.tripEncodedPolyline || null,
 
       driverToPickupDistanceKm: routingData.driverToPickupDistanceKm || null,
       driverToPickupEtaMinutes: routingData.driverToPickupEtaMinutes || null,
-
-      // ✅ Encoded polyline only — compact string, safe for RTDB
       driverToPickupEncodedPolyline: routingData.driverToPickupEncodedPolyline || null,
-
-      // ❌ REMOVED: routeGeometry — raw coordinate array, too large for RTDB
-      // ❌ REMOVED: driverToPickupGeometry — raw coordinate array, too large for RTDB
 
       vehicleCategory: val(orderData.vehicleCategory),
       dispatchService: val(orderData.dispatchService),
@@ -1863,46 +1832,39 @@ async function sendRequestToDriver(
 }
  
 /* =======================================================
-   🔥 DISPATCH ORDER (CORRECTED — routingData passed)
+   🔥 DISPATCH ORDER (FIX 2: stops & Firestore field names)
 ======================================================= */
 async function dispatchOrder(orderId, orderData) {
   try {
     const workflowType = val(orderData.workflowType);
 
-    if (workflowType === "direct_trip") {
-      await db.collection("orders").doc(orderId).update({
-        driverStatus: "searching",
-        dispatchStartedAt: now()
-      });
-    }
+    await db.collection("orders").doc(orderId).update({
+      driverStatus: "searching",
+      dispatchStartedAt: now()
+    });
 
-    if (workflowType === "store_delivery" || workflowType === "delivery") {
-      await db.collection("orders").doc(orderId).update({
-        driverStatus: "searching",
-        dispatchStartedAt: now()
-      });
-    }
+    // Extract stops with coordinates (filter out zero-coord stops)
+    const stops = (orderData.stops || []).filter(
+      s => s && Number(s.lat) !== 0 && Number(s.lng) !== 0
+    );
 
-    // Step 1: Get trip route (pickup → destination)
+    // Step 1: Get trip route (pickup → stops → destination) via ORS
     const tripRouteData = await getRouteDataWithFallback(
       Number(orderData.pickupLat),
       Number(orderData.pickupLng),
       Number(orderData.dropLat),
-      Number(orderData.dropLng)
+      Number(orderData.dropLng),
+      stops
     );
 
-    // Step 2: Find best matching driver (also gets driver → pickup route)
+    // Step 2: Find best matching driver (parallel ORS calls inside)
     const matchedDriver = await findMatchingDriver(orderData);
 
     if (!matchedDriver) {
-      await db.collection("orders").doc(orderId).update({
-        driverStatus: "no_driver_found"
-      });
+      await db.collection("orders").doc(orderId).update({ driverStatus: "no_driver_found" });
       return;
     }
 
-    // Step 3: Build routingData object — key names must match
-    // what sendRequestToDriver reads (tripEncodedPolyline, tripDurationMinutes)
     const routingData = {
       tripDistanceKm: tripRouteData.distanceKm,
       tripDurationMinutes: tripRouteData.durationMinutes,
@@ -1912,26 +1874,23 @@ async function dispatchOrder(orderId, orderData) {
       driverToPickupEncodedPolyline: matchedDriver.driverToPickupEncodedPolyline || null
     };
 
-    // Step 4: Save routing fields to Firestore order doc for client app
+    // Step 4: Save to Firestore — use field names the client app reads
     await db.collection("orders").doc(orderId).update({
       driverId: matchedDriver.uid,
       distanceKm: tripRouteData.distanceKm,
       durationMinutes: tripRouteData.durationMinutes,
-      encodedPolyline: tripRouteData.encodedPolyline,
+      polyline: tripRouteData.encodedPolyline,                          // client reads: orderData.polyline
       driverToPickupDistanceKm: matchedDriver.driverToPickupDistanceKm || null,
       driverToPickupEtaMinutes: matchedDriver.driverToPickupEtaMinutes || null,
-      driverToPickupEncodedPolyline: matchedDriver.driverToPickupEncodedPolyline || null
+      driverToPickupPolyline: matchedDriver.driverToPickupEncodedPolyline || null  // client reads: orderData.driverToPickupPolyline
     });
 
-    // Step 5: Send request to driver with full routing data
+    // Step 5: Send request to driver
     await sendRequestToDriver(
       orderId,
-      {
-        ...orderData,
-        driverStatus: "searching"
-      },
+      { ...orderData, driverStatus: "searching" },
       matchedDriver.uid,
-      routingData  // ← this is what was missing before
+      routingData
     );
 
   } catch (error) {
@@ -2737,443 +2696,133 @@ db.collection("orders")
   );
 
 /* =======================================================
-   🚕 GET RIDE OPTIONS (MODIFIED WITH ORS)
+   🚕 GET RIDE OPTIONS (FIX 4: stops, parallel pricing, polyline)
 ======================================================= */
-app.post(
-  "/getRideOptions",
-  async (req, res) => {
-
-    try {
-
-      const body =
-        req.body || {};
-
-      const pickupLat =
-        Number(
-          body.pickupLat
-        );
-
-      const pickupLng =
-        Number(
-          body.pickupLng
-        );
-
-      const dropLat =
-        Number(
-          body.dropLat
-        );
-
-      const dropLng =
-        Number(
-          body.dropLng
-        );
-
-      const serviceType =
-        (
-          body.serviceType ||
-          "ride"
-        ).toLowerCase();
-
-      // Get actual road route data for the trip
-      const tripRoute = await getRouteDataWithFallback(
-        pickupLat,
-        pickupLng,
-        dropLat,
-        dropLng
-      );
-      
-      const tripKm = tripRoute.distanceKm;
-      const tripDurationMinutes = tripRoute.durationMinutes;
-      const tripGeometry = tripRoute.geometry;
-      const tripEncodedPolyline = tripRoute.encodedPolyline;
-
-      let categories =
-        [];
-
-      if (
-        serviceType ===
-        "ride"
-      ) {
-
-        categories = [
-
-          "economy",
-
-          "comfort",
-
-          "premium",
-
-          "women",
-
-          "aletwende",
-
-          "xl",
-
-          "xxl"
-        ];
-      }
-
-      if (
-
-        serviceType ===
-          "courier" ||
-
-        serviceType ===
-          "package"
-
-      ) {
-
-        categories = [
-
-          "delivery_bicycle",
-
-          "delivery_motorbike",
-
-          "delivery_car"
-        ];
-      }
-
-      if (
-        serviceType ===
-        "delivery"
-      ) {
-
-        categories = [
-
-          "delivery_bicycle",
-
-          "delivery_motorbike",
-
-          "delivery_car",
-
-          "open_truck",
-
-          "closed_truck"
-        ];
-      }
-
-      if (
-
-        serviceType ===
-          "delivery_truck"
-
-      ) {
-
-        categories = [
-          "delivery_truck"
-        ];
-      }
-
-      const onlineSnap =
-        await rtdb
-          .ref(
-            "drivers_online"
-          )
-          .once("value");
-
-      const locationSnap =
-        await rtdb
-          .ref(
-            "driver_locations"
-          )
-          .once("value");
-
-      const online =
-        onlineSnap.val() || {};
-
-      const locations =
-        locationSnap.val() || {};
-
-      const driversSnap =
-        await db
-          .collection(
-            "drivers"
-          )
-          .get();
-
-      const drivers = [];
-
-      driversSnap.forEach(
-        (doc) => {
-
-          const d =
-            doc.data() || {};
-
-          const uid =
-            d.uid || doc.id;
-
-          if (!uid) return;
-
-          if (
-            !online[uid]
-              ?.isOnline
-          ) return;
-
-          if (
-            online[uid]
-              ?.isBusy
-          ) return;
-
-          if (
-            !locations[uid]
-              ?.l
-          ) return;
-
-          if (
-            !d.vehicle
-          ) return;
-
-          if (
-
-            !d.vehicle
-              .services
-              .includes(
-                serviceType
-              )
-
-          ) return;
-
-          const lat =
-            Number(
-              locations[
-                uid
-              ].l[0]
-            );
-
-          const lng =
-            Number(
-              locations[
-                uid
-              ].l[1]
-            );
-
-          const distance =
-            haversine(
-
-              pickupLat,
-
-              pickupLng,
-
-              lat,
-
-              lng
-            );
-
-          if (
-            distance > 7
-          ) return;
-
-          drivers.push({
-
-            uid,
-
-            distance,
-
-            vehicle:
-              d.vehicle
-          });
-        }
-      );
-
-      const cards = [];
-
-      const DISPLAY_NAMES = {
-
-        delivery_car:
-          "Car",
-
-        delivery_motorbike:
-          "Motorbike",
-
-        delivery_bicycle:
-          "Bicycle",
-
-        open_truck:
-          "Open Truck",
-
-        closed_truck:
-          "Closed Truck",
-
-        economy:
-          "Economy",
-
-        comfort:
-          "Comfort",
-
-        premium:
-          "Premium",
-
-        xl:
-          "XL",
-
-        xxl:
-          "XXL"
-      };
-
-      for (
-        const category of categories
-      ) {
-
-        const match =
-          drivers.find(
-
-            (d) =>
-
-              d.vehicle
-                .vehicleCategory
-                .includes(
-                  category
-                )
-          );
-
-        if (
-          !match
-        ) {
-
-          cards.push({
-
-            category,
-
-            title:
-              DISPLAY_NAMES[
-                category
-              ] || category,
-
-            enabled:
-              false,
-
-            eta:
-              null,
-
-            price:
-              null,
-
-            seats:
-              null,
-
-            image:
-              `${category}.png`,
-
-            // NEW: Return routing data even for disabled options
-            distanceKm: null,
-            durationMinutes: null,
-            routeGeometry: null,
-            encodedPolyline: null
-          });
-
-          continue;
-        }
-
-        const pricingKey =
-          match.vehicle
-            .pricingCategory
-            .find(
-
-              (p) =>
-                p.includes(
-                  category
-                )
-            ) ||
-
-          match.vehicle
-            .pricingCategory[0];
-
-        const pricingDoc =
-          await db
-            .collection(
-              "pricing"
-            )
-            .doc(
-              pricingKey
-            )
-            .get();
-
-        let baseFare = 40;
-
-        if (
-          pricingDoc.exists
-        ) {
-
-          baseFare =
-            pricingDoc.data()
-              .baseFare || 40;
-        }
-
-        // Calculate driver ETA to pickup using haversine (quick estimate)
-        const driverEtaMinutes = Math.max(
-          2,
-          Math.round(match.distance * 2)
-        );
-
-        // Calculate price using actual road distance from ORS
-        const price =
-          calculateFare(
-            baseFare,
-            tripKm
-          );
-
-        cards.push({
-
-          category,
-
-          title:
-            DISPLAY_NAMES[
-              category
-            ] || category,
-
-          dispatchService:
-            pricingKey,
-
-          pricingCategory:
-            pricingKey,
-
-          enabled:
-            true,
-
-          eta: driverEtaMinutes,
-
-          price,
-
-          seats:
-            serviceType ===
-            "ride"
-
-              ? (
-                match.vehicle
-                  .maxSeats || 4
-              )
-
-              : null,
-
-          image:
-            `${category}.png`,
-
-          // NEW: Return actual routing data from ORS
-          distanceKm: tripKm,
-          durationMinutes: tripDurationMinutes,
-          routeGeometry: tripGeometry,
-          encodedPolyline: tripEncodedPolyline
-        });
-      }
-
-      return res.json(
-        cards
-      );
-
-    } catch (error) {
-
-      console.error("Error in /getRideOptions:", error);
-      
-      return res
-        .status(500)
-        .json({
-
-          error:
-            error.message
-        });
+app.post("/getRideOptions", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const pickupLat = Number(body.pickupLat);
+    const pickupLng = Number(body.pickupLng);
+    const dropLat = Number(body.dropLat);
+    const dropLng = Number(body.dropLng);
+    const serviceType = (body.serviceType || "ride").toLowerCase();
+
+    // Extract stops with real coordinates
+    const stops = (Array.isArray(body.stops) ? body.stops : []).filter(
+      s => s && Number(s.lat) !== 0 && Number(s.lng) !== 0
+    );
+
+    // Get route (with stops if any) — ONE ORS call for the whole trip
+    const tripRoute = await getRouteDataWithFallback(pickupLat, pickupLng, dropLat, dropLng, stops);
+    const tripKm = tripRoute.distanceKm;
+    const tripDurationMinutes = tripRoute.durationMinutes;
+    const tripEncodedPolyline = tripRoute.encodedPolyline;  // same polyline for all vehicle cards
+
+    let categories = [];
+
+    if (serviceType === "ride") {
+      categories = ["economy", "comfort", "premium", "women", "aletwende", "xl", "xxl"];
     }
+
+    if (serviceType === "courier" || serviceType === "package") {
+      categories = ["delivery_bicycle", "delivery_motorbike", "delivery_car"];
+    }
+
+    if (serviceType === "delivery") {
+      categories = ["delivery_bicycle", "delivery_motorbike", "delivery_car", "open_truck", "closed_truck"];
+    }
+
+    if (serviceType === "delivery_truck") {
+      categories = ["delivery_truck"];
+    }
+
+    const onlineSnap = await rtdb.ref("drivers_online").once("value");
+    const locationSnap = await rtdb.ref("driver_locations").once("value");
+
+    const online = onlineSnap.val() || {};
+    const locations = locationSnap.val() || {};
+
+    const driversSnap = await db.collection("drivers").get();
+
+    const drivers = [];
+
+    driversSnap.forEach((doc) => {
+      const d = doc.data() || {};
+      const uid = d.uid || doc.id;
+
+      if (!uid) return;
+      if (!online[uid]?.isOnline) return;
+      if (online[uid]?.isBusy) return;
+      if (!locations[uid]?.l) return;
+      if (!d.vehicle) return;
+      if (!d.vehicle.services.includes(serviceType)) return;
+
+      const lat = Number(locations[uid].l[0]);
+      const lng = Number(locations[uid].l[1]);
+      const distance = haversine(pickupLat, pickupLng, lat, lng);
+      if (distance > 7) return;
+
+      drivers.push({ uid, distance, vehicle: d.vehicle });
+    });
+
+    // First pass: find matching driver per category (sync, no async needed)
+    const categoryMatches = categories.map(category => {
+      const match = drivers.find(d => d.vehicle.vehicleCategory.includes(category));
+      if (!match) return { category, match: null, pricingKey: null };
+      const pricingKey =
+        match.vehicle.pricingCategory.find(p => p.includes(category)) ||
+        match.vehicle.pricingCategory[0];
+      return { category, match, pricingKey };
+    });
+
+    // Fetch all pricing docs in parallel
+    const pricingResults = await Promise.all(
+      categoryMatches.map(({ pricingKey }) =>
+        pricingKey ? db.collection("pricing").doc(pricingKey).get() : Promise.resolve(null)
+      )
+    );
+
+    // Build cards
+    const DISPLAY_NAMES = {
+      delivery_car: "Car", delivery_motorbike: "Motorbike", delivery_bicycle: "Bicycle",
+      open_truck: "Open Truck", closed_truck: "Closed Truck",
+      economy: "Economy", comfort: "Comfort", premium: "Premium", xl: "XL", xxl: "XXL"
+    };
+
+    const cards = categoryMatches.map(({ category, match, pricingKey }, i) => {
+      if (!match) {
+        return {
+          category, title: DISPLAY_NAMES[category] || category,
+          enabled: false, eta: null, price: null, seats: null,
+          image: `${category}.png`,
+          distanceKm: null, durationMinutes: null, encodedPolyline: null
+        };
+      }
+
+      const pricingDoc = pricingResults[i];
+      const baseFare = pricingDoc?.exists ? (pricingDoc.data().baseFare || 40) : 40;
+      const driverEtaMinutes = Math.max(2, Math.round(match.distance * 2));
+      const price = calculateFare(baseFare, tripKm);
+
+      return {
+        category, title: DISPLAY_NAMES[category] || category,
+        dispatchService: pricingKey, pricingCategory: pricingKey,
+        enabled: true, eta: driverEtaMinutes, price,
+        seats: serviceType === "ride" ? (match.vehicle.maxSeats || 4) : null,
+        image: `${category}.png`,
+        distanceKm: tripKm,
+        durationMinutes: tripDurationMinutes,
+        encodedPolyline: tripEncodedPolyline   // same route polyline for all cards
+      };
+    });
+
+    return res.json(cards);
+
+  } catch (error) {
+    console.error("Error in /getRideOptions:", error);
+    return res.status(500).json({ error: error.message });
   }
-);
+});
 
 /* =======================================================
    HOME
