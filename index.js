@@ -1899,8 +1899,71 @@ async function dispatchOrder(orderId, orderData) {
 }
 
 /* =======================================================
+   🔥 LIVE ETA LISTENERS (NEW FEATURE)
+======================================================= */
+const activeListeners = new Map(); // orderId → { off: Function }
+
+function startPickupEtaListener(orderId, driverId, pickupLat, pickupLng, orderRef) {
+  const key = `pickup_${orderId}`;
+  if (activeListeners.has(key)) return;
+
+  const locRef = rtdb.ref(`driver_locations/${driverId}`);
+  const handler = locRef.on('value', async (snap) => {
+    const loc = snap.val();
+    if (!loc?.l) return;
+    const routeData = await getRouteData(loc.l[0], loc.l[1], pickupLat, pickupLng);
+    if (routeData) {
+      await orderRef.update({
+        driverToPickupEtaMinutes: routeData.durationMinutes,
+        driverToPickupDistanceKm: routeData.distanceKm,
+      }).catch(() => {});
+    }
+  });
+
+  activeListeners.set(key, () => locRef.off('value', handler));
+}
+
+function stopPickupEtaListener(orderId) {
+  const key = `pickup_${orderId}`;
+  const off = activeListeners.get(key);
+  if (off) {
+    off();
+    activeListeners.delete(key);
+  }
+}
+
+function startTripEtaListener(orderId, driverId, dropLat, dropLng, orderRef) {
+  const key = `trip_${orderId}`;
+  if (activeListeners.has(key)) return;
+
+  const locRef = rtdb.ref(`driver_locations/${driverId}`);
+  const handler = locRef.on('value', async (snap) => {
+    const loc = snap.val();
+    if (!loc?.l) return;
+    const routeData = await getRouteData(loc.l[0], loc.l[1], dropLat, dropLng);
+    if (routeData) {
+      await orderRef.update({
+        durationMinutes: routeData.durationMinutes,
+        distanceKm: routeData.distanceKm,
+      }).catch(() => {});
+    }
+  });
+
+  activeListeners.set(key, () => locRef.off('value', handler));
+}
+
+function stopTripEtaListener(orderId) {
+  const key = `trip_${orderId}`;
+  const off = activeListeners.get(key);
+  if (off) {
+    off();
+    activeListeners.delete(key);
+  }
+}
+
+/* =======================================================
    🔥 CENTRALIZED UPDATE TRIP STATUS
-   FRONTEND SYNCED VERSION
+   FRONTEND SYNCED VERSION (WITH LIVE ETA LISTENERS)
 ======================================================= */
 app.post(
   "/updateTripStatus",
@@ -1999,6 +2062,12 @@ app.post(
         val(
           orderData.workflowType
         );
+
+      // Extract coordinates for live ETA listeners
+      const pickupLat = Number(orderData.pickupLat);
+      const pickupLng = Number(orderData.pickupLng);
+      const dropLat = Number(orderData.dropLat);
+      const dropLng = Number(orderData.dropLng);
 
       /* =======================================================
          🔥 DECLINED
@@ -2227,6 +2296,9 @@ app.post(
           }
         }
 
+        // Start pickup ETA listener (for both direct and store delivery)
+        startPickupEtaListener(orderId, driverId, pickupLat, pickupLng, orderRef);
+
         return res.json({
 
           success: true
@@ -2278,6 +2350,9 @@ app.post(
           "arrived"
         );
 
+        // Stop pickup listener (driver has arrived at pickup)
+        stopPickupEtaListener(orderId);
+
         return res.json({
 
           success: true
@@ -2311,6 +2386,11 @@ app.post(
 
           "started"
         );
+
+        // Stop pickup listener if still running
+        stopPickupEtaListener(orderId);
+        // Start trip ETA listener (driver → destination)
+        startTripEtaListener(orderId, driverId, dropLat, dropLng, orderRef);
 
         return res.json({
 
@@ -2346,6 +2426,9 @@ app.post(
           "at_store"
         );
 
+        // Stop pickup listener (driver reached store)
+        stopPickupEtaListener(orderId);
+
         return res.json({
 
           success: true
@@ -2380,6 +2463,11 @@ app.post(
           "picked_up"
         );
 
+        // Stop pickup listener
+        stopPickupEtaListener(orderId);
+        // Start trip ETA listener (store delivery: driver → dropoff)
+        startTripEtaListener(orderId, driverId, dropLat, dropLng, orderRef);
+
         return res.json({
 
           success: true
@@ -2413,6 +2501,10 @@ app.post(
 
           "delivered"
         );
+
+        // Stop both listeners
+        stopPickupEtaListener(orderId);
+        stopTripEtaListener(orderId);
 
         return res.json({
 
@@ -2468,6 +2560,10 @@ app.post(
             currentRequest: null
           });
 
+        // Stop both listeners
+        stopPickupEtaListener(orderId);
+        stopTripEtaListener(orderId);
+
         return res.json({
 
           success: true
@@ -2521,6 +2617,10 @@ app.post(
 
             currentRequest: null
           });
+
+        // Stop both listeners
+        stopPickupEtaListener(orderId);
+        stopTripEtaListener(orderId);
 
         return res.json({
 
