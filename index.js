@@ -1,4 +1,4 @@
- const express = require("express");
+const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 const axios = require("axios");
@@ -1741,7 +1741,7 @@ async function findMatchingDriver(
 }
 
 /* =======================================================
-   🔥 SEND REQUEST TO DRIVER (MODIFIED WITH ROUTING DATA)
+   🔥 SEND REQUEST TO DRIVER (MODIFIED WITH ROUTING DATA + STOPS)
 ======================================================= */
 async function sendRequestToDriver(
   orderId,
@@ -1794,6 +1794,8 @@ async function sendRequestToDriver(
       driverToPickupDistanceKm: routingData.driverToPickupDistanceKm || null,
       driverToPickupEtaMinutes: routingData.driverToPickupEtaMinutes || null,
       driverToPickupEncodedPolyline: routingData.driverToPickupEncodedPolyline || null,
+
+      stops: orderData.stops || [],   // ADDED: top-level stops for driver app
 
       vehicleCategory: val(orderData.vehicleCategory),
       dispatchService: val(orderData.dispatchService),
@@ -2921,6 +2923,109 @@ app.post("/getRideOptions", async (req, res) => {
   } catch (error) {
     console.error("Error in /getRideOptions:", error);
     return res.status(500).json({ error: error.message });
+  }
+});
+
+/* =======================================================
+   🔄 NEW ENDPOINT: /reroutePolyline
+   Recalculates polyline when driver deviates significantly
+======================================================= */
+app.post("/reroutePolyline", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const driverId = val(body.driverId);
+    const orderId = val(body.orderId);
+    const currentLat = Number(body.currentLat);
+    const currentLng = Number(body.currentLng);
+    const phase = val(body.phase); // 'accepted' | 'started' | 'picked_up'
+
+    if (!driverId || !orderId || isNaN(currentLat) || isNaN(currentLng) || !phase) {
+      return res.status(400).json({ success: false, error: "Missing required fields" });
+    }
+
+    const orderRef = db.collection("orders").doc(orderId);
+    const orderDoc = await orderRef.get();
+    if (!orderDoc.exists) {
+      return res.status(404).json({ success: false, error: "Order not found" });
+    }
+
+    const orderData = orderDoc.data() || {};
+    const workflowType = val(orderData.workflowType);
+
+    // Determine destination based on phase + workflow
+    let destLat, destLng;
+    let stops = [];
+
+    if (phase === 'accepted') {
+      // Driver is heading to pickup (direct_trip) or store (store_delivery)
+      if (workflowType === 'store_delivery') {
+        destLat = Number(orderData.storeLat || orderData.pickupLat);
+        destLng = Number(orderData.storeLng || orderData.pickupLng);
+      } else {
+        destLat = Number(orderData.pickupLat);
+        destLng = Number(orderData.pickupLng);
+      }
+      // No stops on the driver-to-pickup leg
+    } else if (phase === 'started' || phase === 'picked_up') {
+      // Driver is heading to dropoff
+      destLat = Number(orderData.dropLat);
+      destLng = Number(orderData.dropLng);
+      stops = (orderData.stops || []).filter(
+        s => s && Number(s.lat) !== 0 && Number(s.lng) !== 0
+      );
+    } else {
+      return res.status(400).json({ success: false, error: "Invalid phase" });
+    }
+
+    // Get fresh route from current driver position → destination (with stops if applicable)
+    const routeData = await getRouteDataWithFallback(currentLat, currentLng, destLat, destLng, stops);
+
+    if (!routeData || !routeData.encodedPolyline) {
+      return res.status(500).json({ success: false, error: "Could not compute new route" });
+    }
+
+    // Determine which field to update based on phase
+    // phase === 'accepted' → updates the driver-to-pickup/store polyline
+    // phase === 'started' or 'picked_up' → updates the main trip polyline
+    const isPickupLeg = phase === 'accepted';
+
+    // Update Firestore (client app listens here)
+    const firestoreUpdate = isPickupLeg
+      ? {
+          driverToPickupPolyline: routeData.encodedPolyline,
+          driverToPickupDistanceKm: routeData.distanceKm,
+          driverToPickupEtaMinutes: routeData.durationMinutes,
+        }
+      : {
+          polyline: routeData.encodedPolyline,
+          distanceKm: routeData.distanceKm,
+          durationMinutes: routeData.durationMinutes,
+        };
+
+    await orderRef.update(firestoreUpdate);
+
+    // Update RTDB driver_trip_requests node (driver app listens here via useActiveTrip)
+    const rtdbUpdate = isPickupLeg
+      ? {
+          driverToPickupEncodedPolyline: routeData.encodedPolyline,
+          driverToPickupDistanceKm: routeData.distanceKm,
+          driverToPickupEtaMinutes: routeData.durationMinutes,
+        }
+      : {
+          encodedPolyline: routeData.encodedPolyline,
+          tripDistanceKm: routeData.distanceKm,
+          tripEtaMinutes: routeData.durationMinutes,
+        };
+
+    await rtdb.ref(`driver_trip_requests/${driverId}/${orderId}`).update(rtdbUpdate);
+
+    console.log(`Rerouted order ${orderId} for driver ${driverId}, phase=${phase}, new polyline length=${routeData.encodedPolyline.length}`);
+
+    return res.json({ success: true, data: { distanceKm: routeData.distanceKm, durationMinutes: routeData.durationMinutes } });
+
+  } catch (error) {
+    console.error("Error in /reroutePolyline:", error);
+    return res.status(500).json({ success: false, error: error.message });
   }
 });
 
