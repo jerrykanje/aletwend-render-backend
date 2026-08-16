@@ -1,4 +1,4 @@
-const express = require("express");
+ const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 const axios = require("axios");
@@ -3026,6 +3026,183 @@ app.post("/reroutePolyline", async (req, res) => {
   } catch (error) {
     console.error("Error in /reroutePolyline:", error);
     return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/* =======================================================
+   🔄 NEW ENDPOINT: /updateOrderStops
+   Updates stops and recalculates route & fare for an existing order
+   Body: { orderId, driverId, stops, selectedVehicle, userId? }
+======================================================= */
+app.post("/updateOrderStops", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const orderId = val(body.orderId);
+    const driverId = val(body.driverId);
+    const newStops = body.stops || [];
+    const selectedVehicle = body.selectedVehicle || null;
+
+    if (!orderId || !driverId) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing orderId or driverId"
+      });
+    }
+
+    // Validate stops array
+    if (!Array.isArray(newStops)) {
+      return res.status(400).json({
+        success: false,
+        error: "stops must be an array"
+      });
+    }
+
+    const orderRef = db.collection("orders").doc(orderId);
+    const orderDoc = await orderRef.get();
+
+    if (!orderDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        error: "Order not found"
+      });
+    }
+
+    const orderData = orderDoc.data() || {};
+    const workflowType = val(orderData.workflowType);
+
+    // Filter out empty/invalid stops
+    const validStops = newStops.filter(
+      s => s && s.lat && s.lng && Number(s.lat) !== 0 && Number(s.lng) !== 0
+    );
+
+    // Get pickup and destination coordinates from the order
+    const pickupLat = Number(orderData.pickupLat);
+    const pickupLng = Number(orderData.pickupLng);
+    const dropLat = Number(orderData.dropLat);
+    const dropLng = Number(orderData.dropLng);
+
+    // Recalculate route with new stops
+    const routeData = await getRouteDataWithFallback(
+      pickupLat,
+      pickupLng,
+      dropLat,
+      dropLng,
+      validStops
+    );
+
+    if (!routeData || !routeData.encodedPolyline) {
+      return res.status(500).json({
+        success: false,
+        error: "Could not compute route with the new stops"
+      });
+    }
+
+    // Get the pricing key from order or selectedVehicle
+    let pricingKey = orderData.pricingCategory || orderData.dispatchService;
+
+    // If selectedVehicle is provided, use it to look up pricing
+    if (selectedVehicle) {
+      // Try to get the pricing key from selectedVehicle
+      const vehicleDoc = await db
+        .collection("pricing")
+        .doc(selectedVehicle)
+        .get();
+
+      if (vehicleDoc.exists) {
+        pricingKey = selectedVehicle;
+      } else {
+        // Try to find matching pricing category
+        const driversSnap = await db
+          .collection("drivers")
+          .where("uid", "==", driverId)
+          .get();
+
+        if (!driversSnap.empty) {
+          const driverData = driversSnap.docs[0].data();
+          const vehicleCategories = driverData?.vehicle?.pricingCategory || [];
+          const matchedKey = vehicleCategories.find(cat =>
+            cat.toLowerCase().includes(selectedVehicle.toLowerCase())
+          );
+          if (matchedKey) {
+            pricingKey = matchedKey;
+          }
+        }
+      }
+    }
+
+    // If still no pricing key, fallback to order's existing pricing or default
+    if (!pricingKey) {
+      pricingKey = orderData.pricingCategory ||
+                   orderData.dispatchService ||
+                   "economy";
+    }
+
+    // Get base fare from pricing collection
+    let baseFare = 40;
+    try {
+      const pricingDoc = await db
+        .collection("pricing")
+        .doc(pricingKey)
+        .get();
+
+      if (pricingDoc.exists) {
+        baseFare = pricingDoc.data().baseFare || 40;
+      }
+    } catch (error) {
+      console.log("Pricing lookup error:", error);
+    }
+
+    // Calculate new fare based on updated distance
+    const newFare = calculateFare(baseFare, routeData.distanceKm);
+
+    // Update the order document with new stops, route, and fare
+    const updateData = {
+      stops: validStops,
+      polyline: routeData.encodedPolyline,
+      distanceKm: routeData.distanceKm,
+      durationMinutes: routeData.durationMinutes,
+      fare: newFare,
+      pricingCategory: pricingKey,
+      updatedAt: now()
+    };
+
+    await orderRef.update(updateData);
+
+    // Also update the driver_trip_requests in RTDB if active
+    const rtdbPayload = {
+      stops: validStops,
+      encodedPolyline: routeData.encodedPolyline,
+      tripDistanceKm: routeData.distanceKm,
+      tripEtaMinutes: routeData.durationMinutes,
+      fare: newFare
+    };
+
+    await rtdb
+      .ref(`driver_trip_requests/${driverId}/${orderId}`)
+      .update(rtdbPayload)
+      .catch(() => {}); // Non-critical if request expired
+
+    console.log(`Order ${orderId} stops updated: ${validStops.length} stops, new fare: ${newFare}`);
+
+    return res.json({
+      success: true,
+      data: {
+        orderId,
+        stops: validStops,
+        distanceKm: routeData.distanceKm,
+        durationMinutes: routeData.durationMinutes,
+        fare: newFare,
+        polyline: routeData.encodedPolyline,
+        pricingCategory: pricingKey
+      }
+    });
+
+  } catch (error) {
+    console.error("Error in /updateOrderStops:", error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
   }
 });
 
