@@ -3032,7 +3032,7 @@ app.post("/reroutePolyline", async (req, res) => {
 /* =======================================================
    🔄 NEW ENDPOINT: /updateOrderStops
    Updates stops and recalculates route & fare for an existing order
-   Body: { orderId, driverId, stops, selectedVehicle, userId? }
+   Body: { orderId, driverId, stops, selectedVehicle, userId?, dryRun? }
 ======================================================= */
 app.post("/updateOrderStops", async (req, res) => {
   try {
@@ -3041,6 +3041,7 @@ app.post("/updateOrderStops", async (req, res) => {
     const driverId = val(body.driverId);
     const newStops = body.stops || [];
     const selectedVehicle = body.selectedVehicle || null;
+    const dryRun = body.dryRun === true;
 
     if (!orderId || !driverId) {
       return res.status(400).json({
@@ -3154,6 +3155,20 @@ app.post("/updateOrderStops", async (req, res) => {
 
     // Calculate new fare based on updated distance
     const newFare = calculateFare(baseFare, routeData.distanceKm);
+
+    // DRY RUN: return computed result without writing to Firestore or RTDB
+    if (dryRun === true) {
+      return res.json({
+        success: true,
+        data: {
+          distanceKm: routeData.distanceKm,
+          durationMinutes: routeData.durationMinutes,
+          fare: newFare,
+          polyline: routeData.encodedPolyline,
+          pricingCategory: pricingKey
+        }
+      });
+    }
 
     // Update the order document with new stops, route, and fare
     const updateData = {
