@@ -3164,6 +3164,7 @@ app.post("/updateOrderStops", async (req, res) => {
           distanceKm: routeData.distanceKm,
           durationMinutes: routeData.durationMinutes,
           fare: newFare,
+          total: newFare,
           polyline: routeData.encodedPolyline,
           pricingCategory: pricingKey
         }
@@ -3177,6 +3178,7 @@ app.post("/updateOrderStops", async (req, res) => {
       distanceKm: routeData.distanceKm,
       durationMinutes: routeData.durationMinutes,
       fare: newFare,
+      total: newFare,
       pricingCategory: pricingKey,
       updatedAt: now()
     };
