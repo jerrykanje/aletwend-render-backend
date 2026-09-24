@@ -653,6 +653,124 @@ app.post("/getRoute", async (req, res) => {
 });
 
 /* =======================================================
+   📍 NEW ENDPOINT: REVERSE GEOCODE
+   POST /reverseGeocode
+   Body: { lat, lng }
+   Returns: { address: string }
+   
+   Stateless proxy to ORS /geocode/reverse endpoint.
+   NEVER writes to Firestore or RTDB.
+   Falls back to "Dropped pin" on any failure so the client
+   always gets a usable label for the map pin.
+======================================================= */
+app.post("/reverseGeocode", async (req, res) => {
+  const FALLBACK_ADDRESS = "Dropped pin";
+
+  try {
+    const body = req.body || {};
+    const lat = Number(body.lat);
+    const lng = Number(body.lng);
+
+    // Validate coordinates
+    if (isNaN(lat) || isNaN(lng)) {
+      return res.json({
+        success: true,
+        address: FALLBACK_ADDRESS
+      });
+    }
+
+    const ORS_API_KEY = process.env.ORS_API_KEY;
+    if (!ORS_API_KEY) {
+      console.error("ORS_API_KEY not configured for reverse geocode");
+      return res.json({
+        success: true,
+        address: FALLBACK_ADDRESS
+      });
+    }
+
+    // ORS reverse geocoding endpoint
+    // Docs: https://openrouteservice.org/dev/#/api-docs/geocode/reverse/get
+    const response = await axios.get(
+      "https://api.openrouteservice.org/geocode/reverse",
+      {
+        params: {
+          "api_key": ORS_API_KEY,
+          "point.lat": lat,
+          "point.lon": lng,
+          "size": 1,
+          "boundary.circle.radius": 0.1,
+          "layers": "address,street,venue,locality"
+        },
+        timeout: 6000,
+        headers: {
+          "Accept": "application/json"
+        }
+      }
+    );
+
+    // Parse the ORS response
+    const features = response.data?.features || [];
+
+    if (!features.length) {
+      return res.json({
+        success: true,
+        address: FALLBACK_ADDRESS
+      });
+    }
+
+    const feature = features[0];
+    const props = feature.properties || {};
+    const label = props.label || props.name || "";
+
+    // If ORS gave us a label, use it. Otherwise build a clean single-line string
+    // from the available structured address parts.
+    let formatted = "";
+    if (label && typeof label === "string" && label.trim().length > 0) {
+      formatted = label.trim();
+    } else {
+      const parts = [
+        props.name,
+        props.street,
+        props.locality,
+        props.region,
+        props.country
+      ].filter(Boolean);
+      formatted = parts.join(", ").trim();
+    }
+
+    if (!formatted) {
+      formatted = FALLBACK_ADDRESS;
+    }
+
+    // Collapse any whitespace/newlines into a single clean line
+    formatted = formatted.replace(/\s+/g, " ").trim();
+
+    // Cap length so the UI label stays reasonable
+    if (formatted.length > 200) {
+      formatted = formatted.slice(0, 200).trim() + "…";
+    }
+
+    return res.json({
+      success: true,
+      address: formatted
+    });
+
+  } catch (error) {
+    // Never surface errors to the client for this label-only endpoint
+    console.error(
+      "reverseGeocode error:",
+      error.response?.status,
+      error.response?.data?.error?.message || error.message
+    );
+
+    return res.json({
+      success: true,
+      address: FALLBACK_ADDRESS
+    });
+  }
+});
+
+/* =======================================================
    🔥 RTDB REQUEST STATUS SYNC
 ======================================================= */
 async function updateDriverRequestStatus(
