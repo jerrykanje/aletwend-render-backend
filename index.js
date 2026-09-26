@@ -1,8 +1,9 @@
- const express = require("express");
+const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 const axios = require("axios");
 const polyline = require("polyline");
+const { RtcTokenBuilder, RtcRole } = require("agora-token");
 
 const app = express();
 
@@ -38,6 +39,24 @@ const val = (x) => x ?? "";
 
 const now = () =>
   admin.firestore.FieldValue.serverTimestamp();
+
+/* =======================================================
+   🔔 PUSH NOTIFICATION HELPER (NEW)
+   Fire-and-forget FCM send. Never throws.
+======================================================= */
+async function sendPushNotification(fcmToken, title, body, data = {}) {
+  if (!fcmToken) return;
+  try {
+    await admin.messaging().send({
+      token: fcmToken,
+      notification: { title, body },
+      data
+    });
+    console.log(`Push sent: "${title}"`);
+  } catch (e) {
+    console.log('push error', e?.message || e);
+  }
+}
 
 /* =======================================================
    🗺️ ORS ROUTING HELPER FUNCTIONS (FIX 1 APPLIED)
@@ -653,120 +672,105 @@ app.post("/getRoute", async (req, res) => {
 });
 
 /* =======================================================
-   📍 NEW ENDPOINT: REVERSE GEOCODE
-   POST /reverseGeocode
-   Body: { lat, lng }
-   Returns: { address: string }
-   
-   Stateless proxy to ORS /geocode/reverse endpoint.
-   NEVER writes to Firestore or RTDB.
-   Falls back to "Dropped pin" on any failure so the client
-   always gets a usable label for the map pin.
-======================================================= */
-app.post("/reverseGeocode", async (req, res) => {
-  const FALLBACK_ADDRESS = "Dropped pin";
+   📞 NEW ENDPOINT: /api/calls/token
+   In-app calling (Agora) token generation.
 
+   Body: { channelName, uid }
+
+   Convention: channelName should be "ride_<orderId>".
+   When it matches this pattern we verify the requester is
+   actually part of the order (riderId or driverId) before
+   issuing a token. Non-matching channel names fall through
+   without a check so other call types (e.g. support) work.
+
+   Returns: { success, token, appId, channelName, uid, expiresAt }
+======================================================= */
+app.post("/api/calls/token", async (req, res) => {
   try {
     const body = req.body || {};
-    const lat = Number(body.lat);
-    const lng = Number(body.lng);
+    const channelName = val(body.channelName);
+    const uid = Number(body.uid) || 0;
 
-    // Validate coordinates
-    if (isNaN(lat) || isNaN(lng)) {
-      return res.json({
-        success: true,
-        address: FALLBACK_ADDRESS
-      });
+    if (!channelName) {
+      return res.status(400).json({ success: false, error: "Missing channelName" });
     }
 
-    const ORS_API_KEY = process.env.ORS_API_KEY;
-    if (!ORS_API_KEY) {
-      console.error("ORS_API_KEY not configured for reverse geocode");
-      return res.json({
-        success: true,
-        address: FALLBACK_ADDRESS
-      });
+    const appId = process.env.AGORA_APP_ID;
+    const appCertificate = process.env.AGORA_APP_CERTIFICATE;
+
+    if (!appId || !appCertificate) {
+      return res.status(500).json({ success: false, error: "Agora credentials not configured on server" });
     }
 
-    // ORS reverse geocoding endpoint
-    // Docs: https://openrouteservice.org/dev/#/api-docs/geocode/reverse/get
-    const response = await axios.get(
-      "https://api.openrouteservice.org/geocode/reverse",
-      {
-        params: {
-          "api_key": ORS_API_KEY,
-          "point.lat": lat,
-          "point.lon": lng,
-          "size": 1,
-          "boundary.circle.radius": 0.1,
-          "layers": "address,street,venue,locality"
-        },
-        timeout: 6000,
-        headers: {
-          "Accept": "application/json"
-        }
+    // ---- Optional but recommended: authorize channel access ----
+    // Only enforce when the channel follows the "ride_<orderId>" convention.
+    if (channelName.startsWith("ride_")) {
+      const orderId = channelName.slice("ride_".length).trim();
+
+      if (!orderId) {
+        return res.status(400).json({ success: false, error: "Invalid ride channel name" });
       }
+
+      try {
+        const orderDoc = await db.collection("orders").doc(orderId).get();
+
+        if (!orderDoc.exists) {
+          return res.status(404).json({ success: false, error: "Order not found for this channel" });
+        }
+
+        const orderData = orderDoc.data() || {};
+        const riderId =
+          orderData.riderId ||
+          orderData.userId ||
+          orderData.customerId ||
+          null;
+        const driverId = orderData.driverId || null;
+
+        const requester = String(uid);
+        const isRider = riderId && String(riderId) === requester;
+        const isDriver = driverId && String(driverId) === requester;
+
+        if (!isRider && !isDriver) {
+          return res.status(403).json({
+            success: false,
+            error: "Not authorized to join this ride channel"
+          });
+        }
+      } catch (authError) {
+        console.log("calls/token auth check error:", authError?.message || authError);
+        // Fail closed for ride channels if we couldn't verify
+        return res.status(500).json({
+          success: false,
+          error: "Could not verify channel authorization"
+        });
+      }
+    }
+    // ---- end authorization ----
+
+    const expireSeconds = 3600; // token valid for 1 hour
+    const currentTimestamp = Math.floor(Date.now() / 1000);
+    const privilegeExpireTs = currentTimestamp + expireSeconds;
+
+    const token = RtcTokenBuilder.buildTokenWithUid(
+      appId,
+      appCertificate,
+      channelName,
+      uid,
+      RtcRole.PUBLISHER,
+      privilegeExpireTs
     );
-
-    // Parse the ORS response
-    const features = response.data?.features || [];
-
-    if (!features.length) {
-      return res.json({
-        success: true,
-        address: FALLBACK_ADDRESS
-      });
-    }
-
-    const feature = features[0];
-    const props = feature.properties || {};
-    const label = props.label || props.name || "";
-
-    // If ORS gave us a label, use it. Otherwise build a clean single-line string
-    // from the available structured address parts.
-    let formatted = "";
-    if (label && typeof label === "string" && label.trim().length > 0) {
-      formatted = label.trim();
-    } else {
-      const parts = [
-        props.name,
-        props.street,
-        props.locality,
-        props.region,
-        props.country
-      ].filter(Boolean);
-      formatted = parts.join(", ").trim();
-    }
-
-    if (!formatted) {
-      formatted = FALLBACK_ADDRESS;
-    }
-
-    // Collapse any whitespace/newlines into a single clean line
-    formatted = formatted.replace(/\s+/g, " ").trim();
-
-    // Cap length so the UI label stays reasonable
-    if (formatted.length > 200) {
-      formatted = formatted.slice(0, 200).trim() + "…";
-    }
 
     return res.json({
       success: true,
-      address: formatted
+      token,
+      appId,
+      channelName,
+      uid,
+      expiresAt: privilegeExpireTs * 1000
     });
-
   } catch (error) {
-    // Never surface errors to the client for this label-only endpoint
-    console.error(
-      "reverseGeocode error:",
-      error.response?.status,
-      error.response?.data?.error?.message || error.message
-    );
-
-    return res.json({
-      success: true,
-      address: FALLBACK_ADDRESS
-    });
+    console.error("Error in /api/calls/token:", error);
+    return res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -1953,6 +1957,7 @@ async function sendRequestToDriver(
  
 /* =======================================================
    🔥 DISPATCH ORDER (FIX 2: stops & Firestore field names)
+   + NEW: push notification to matched driver
 ======================================================= */
 async function dispatchOrder(orderId, orderData) {
   try {
@@ -2005,13 +2010,43 @@ async function dispatchOrder(orderId, orderData) {
       driverToPickupPolyline: matchedDriver.driverToPickupEncodedPolyline || null  // client reads: orderData.driverToPickupPolyline
     });
 
-    // Step 5: Send request to driver
+    // Step 5: Send request to driver (RTDB — existing behavior)
     await sendRequestToDriver(
       orderId,
       { ...orderData, driverStatus: "searching" },
       matchedDriver.uid,
       routingData
     );
+
+    // Step 6 (NEW): Push notification to matched driver — fire and forget
+    (async () => {
+      try {
+        const driverDoc = await db.collection("drivers").doc(matchedDriver.uid).get();
+        if (driverDoc.exists) {
+          const dData = driverDoc.data() || {};
+          const driverToken =
+            dData.fcmToken ||
+            dData.pushToken ||
+            dData?.profile?.fcmToken ||
+            null;
+
+          if (driverToken) {
+            await sendPushNotification(
+              driverToken,
+              "New ride request nearby",
+              "Tap to view the trip details and accept.",
+              {
+                type: "new_trip_request",
+                orderId: String(orderId),
+                workflowType: String(workflowType || "")
+              }
+            );
+          }
+        }
+      } catch (e) {
+        console.log("dispatchOrder push error", e?.message || e);
+      }
+    })();
 
   } catch (error) {
     console.log("dispatchOrder error", error);
@@ -2084,6 +2119,7 @@ function stopTripEtaListener(orderId) {
 /* =======================================================
    🔥 CENTRALIZED UPDATE TRIP STATUS
    FRONTEND SYNCED VERSION (WITH LIVE ETA LISTENERS)
+   + NEW: push notifications to rider
 ======================================================= */
 app.post(
   "/updateTripStatus",
@@ -2188,6 +2224,45 @@ app.post(
       const pickupLng = Number(orderData.pickupLng);
       const dropLat = Number(orderData.dropLat);
       const dropLng = Number(orderData.dropLng);
+
+      // NEW: helper to fire rider push notifications (fire-and-forget)
+      const notifyRider = async (title, bodyText, extra = {}) => {
+        try {
+          const riderId =
+            orderData.riderId ||
+            orderData.userId ||
+            orderData.customerId ||
+            null;
+
+          if (!riderId) return;
+
+          const userDoc = await db.collection("users").doc(riderId).get();
+          if (!userDoc.exists) return;
+
+          const uData = userDoc.data() || {};
+          const riderToken =
+            uData.fcmToken ||
+            uData.pushToken ||
+            uData?.profile?.fcmToken ||
+            null;
+
+          if (!riderToken) return;
+
+          await sendPushNotification(
+            riderToken,
+            title,
+            bodyText,
+            {
+              type: "trip_status",
+              status: String(status || ""),
+              orderId: String(orderId || ""),
+              ...extra
+            }
+          );
+        } catch (e) {
+          console.log("notifyRider error", e?.message || e);
+        }
+      };
 
       /* =======================================================
          🔥 DECLINED
@@ -2419,6 +2494,9 @@ app.post(
         // Start pickup ETA listener (for both direct and store delivery)
         startPickupEtaListener(orderId, driverId, pickupLat, pickupLng, orderRef);
 
+        // NEW: notify rider that a driver accepted
+        notifyRider("Driver is on the way", "Your driver has accepted your trip and is heading to pickup.");
+
         return res.json({
 
           success: true
@@ -2472,6 +2550,9 @@ app.post(
 
         // Stop pickup listener (driver has arrived at pickup)
         stopPickupEtaListener(orderId);
+
+        // NEW: notify rider
+        notifyRider("Your driver has arrived", "Your driver is waiting at the pickup location.");
 
         return res.json({
 
@@ -2683,6 +2764,9 @@ app.post(
         // Stop both listeners
         stopPickupEtaListener(orderId);
         stopTripEtaListener(orderId);
+
+        // NEW: notify rider
+        notifyRider("Trip completed", "Thanks for riding with us. Please rate your experience.");
 
         return res.json({
 
