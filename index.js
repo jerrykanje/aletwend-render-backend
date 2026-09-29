@@ -1,4 +1,4 @@
-const express = require("express");
+ const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 const axios = require("axios");
@@ -672,7 +672,7 @@ app.post("/getRoute", async (req, res) => {
 });
 
 /* =======================================================
-   📞 NEW ENDPOINT: /api/calls/token
+   📞 ENDPOINT: /api/calls/token
    In-app calling (Agora) token generation.
 
    Body: { channelName, uid }
@@ -684,15 +684,20 @@ app.post("/getRoute", async (req, res) => {
    without a check so other call types (e.g. support) work.
 
    Returns: { success, token, appId, channelName, uid, expiresAt }
+   uid is the raw Firebase Auth string, echoed back unchanged.
 ======================================================= */
 app.post("/api/calls/token", async (req, res) => {
   try {
     const body = req.body || {};
     const channelName = val(body.channelName);
-    const uid = Number(body.uid) || 0;
+    const uid = val(body.uid); // FIX: keep as string, do NOT coerce to number
 
     if (!channelName) {
       return res.status(400).json({ success: false, error: "Missing channelName" });
+    }
+
+    if (!uid) {
+      return res.status(400).json({ success: false, error: "Missing uid" });
     }
 
     const appId = process.env.AGORA_APP_ID;
@@ -726,9 +731,9 @@ app.post("/api/calls/token", async (req, res) => {
           null;
         const driverId = orderData.driverId || null;
 
-        const requester = String(uid);
-        const isRider = riderId && String(riderId) === requester;
-        const isDriver = driverId && String(driverId) === requester;
+        // FIX: compare raw strings, no coercion in either direction
+        const isRider = riderId && riderId === uid;
+        const isDriver = driverId && driverId === uid;
 
         if (!isRider && !isDriver) {
           return res.status(403).json({
@@ -751,7 +756,8 @@ app.post("/api/calls/token", async (req, res) => {
     const currentTimestamp = Math.floor(Date.now() / 1000);
     const privilegeExpireTs = currentTimestamp + expireSeconds;
 
-    const token = RtcTokenBuilder.buildTokenWithUid(
+    // FIX: use buildTokenWithAccount (string user IDs), not buildTokenWithUid
+    const token = RtcTokenBuilder.buildTokenWithAccount(
       appId,
       appCertificate,
       channelName,
@@ -765,7 +771,7 @@ app.post("/api/calls/token", async (req, res) => {
       token,
       appId,
       channelName,
-      uid,
+      uid, // echoed back as the same string
       expiresAt: privilegeExpireTs * 1000
     });
   } catch (error) {
