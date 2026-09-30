@@ -672,111 +672,350 @@ app.post("/getRoute", async (req, res) => {
 });
 
 /* =======================================================
-   📞 ENDPOINT: /api/calls/token
-   In-app calling (Agora) token generation.
+   📞 CALLS — SIGNALING + AGORA TOKENS
+   Replaces the old POST /api/calls/token route.
 
-   Body: { channelName, uid }
+   RTDB layout (written ONLY by this server):
+     calls/{callId}        master record (no client access)
+     user_calls/{uid}      each participant's current-call copy (client reads own)
 
-   Convention: channelName should be "ride_<orderId>".
-   When it matches this pattern we verify the requester is
-   actually part of the order (riderId or driverId) before
-   issuing a token. Non-matching channel names fall through
-   without a check so other call types (e.g. support) work.
+   Endpoints (all require  Authorization: Bearer <Firebase ID token>):
+     POST /api/calls/start    { orderId }
+     POST /api/calls/accept   { callId }
+     POST /api/calls/decline  { callId }
+     POST /api/calls/end      { callId, reason? }   reason "no_answer" => status "missed"
 
-   Returns: { success, token, appId, channelName, uid, expiresAt }
-   uid is the raw Firebase Auth string, echoed back unchanged.
+   Caller and receiver are derived from the ORDER (userId / driverId),
+   never from what the client claims.
 ======================================================= */
-app.post("/api/calls/token", async (req, res) => {
+const CALL_RING_MS = 45000;
+const CALL_STALE_ACTIVE_MS = 2 * 60 * 60 * 1000;
+const CALL_ORDER_STATUSES = [
+  "accepted",
+  "driver_assigned",
+  "arrived",
+  "started",
+  "at_store",
+  "picked_up"
+];
+
+// ---- auth: returns verified uid, or sends 401 and returns null ----
+async function requireCallUser(req, res) {
   try {
-    const body = req.body || {};
-    const channelName = val(body.channelName);
-    const uid = val(body.uid); // FIX: keep as string, do NOT coerce to number
-
-    if (!channelName) {
-      return res.status(400).json({ success: false, error: "Missing channelName" });
+    const header = req.headers.authorization || "";
+    const match = header.match(/^Bearer (.+)$/i);
+    if (!match) {
+      res.status(401).json({ success: false, error: "Missing auth token" });
+      return null;
     }
+    const decoded = await admin.auth().verifyIdToken(match[1]);
+    return decoded.uid;
+  } catch (e) {
+    res.status(401).json({ success: false, error: "Invalid auth token" });
+    return null;
+  }
+}
 
-    if (!uid) {
-      return res.status(400).json({ success: false, error: "Missing uid" });
-    }
+// ---- Agora token for a string uid (agora-token v2 API, durations in seconds) ----
+function buildCallCredentials(channelName, uid) {
+  const appId = process.env.AGORA_APP_ID;
+  const appCertificate = process.env.AGORA_APP_CERTIFICATE;
+  if (!appId || !appCertificate) {
+    throw new Error("Agora credentials not configured on server");
+  }
+  const expireSeconds = 3600;
+  const token = RtcTokenBuilder.buildTokenWithUserAccount(
+    appId,
+    appCertificate,
+    channelName,
+    uid,
+    RtcRole.PUBLISHER,
+    expireSeconds,
+    expireSeconds
+  );
+  return {
+    appId,
+    token,
+    channel: channelName,
+    uid,
+    tokenExpiresAt: Date.now() + expireSeconds * 1000
+  };
+}
 
-    const appId = process.env.AGORA_APP_ID;
-    const appCertificate = process.env.AGORA_APP_CERTIFICATE;
+// ---- per-user copy of a call record ----
+function callCopyFor(call, uid) {
+  return {
+    ...call,
+    direction: call.callerId === uid ? "outgoing" : "incoming",
+    peerName: call.callerId === uid ? call.receiverName : call.callerName
+  };
+}
 
-    if (!appId || !appCertificate) {
-      return res.status(500).json({ success: false, error: "Agora credentials not configured on server" });
-    }
-
-    // ---- Optional but recommended: authorize channel access ----
-    // Only enforce when the channel follows the "ride_<orderId>" convention.
-    if (channelName.startsWith("ride_")) {
-      const orderId = channelName.slice("ride_".length).trim();
-
-      if (!orderId) {
-        return res.status(400).json({ success: false, error: "Invalid ride channel name" });
+// ---- update master + both user copies (only copies that still point at this call) ----
+async function applyCallUpdate(call, fields) {
+  const updates = {};
+  const next = { ...call, ...fields };
+  for (const [k, v] of Object.entries(fields)) {
+    updates[`calls/${call.callId}/${k}`] = v;
+  }
+  for (const pid of [call.callerId, call.receiverId]) {
+    const snap = await rtdb.ref(`user_calls/${pid}/callId`).once("value");
+    if (snap.val() === call.callId) {
+      for (const [k, v] of Object.entries(fields)) {
+        updates[`user_calls/${pid}/${k}`] = v;
       }
-
-      try {
-        const orderDoc = await db.collection("orders").doc(orderId).get();
-
-        if (!orderDoc.exists) {
-          return res.status(404).json({ success: false, error: "Order not found for this channel" });
-        }
-
-        const orderData = orderDoc.data() || {};
-        const riderId =
-          orderData.riderId ||
-          orderData.userId ||
-          orderData.customerId ||
-          null;
-        const driverId = orderData.driverId || null;
-
-        // FIX: compare raw strings, no coercion in either direction
-        const isRider = riderId && riderId === uid;
-        const isDriver = driverId && driverId === uid;
-
-        if (!isRider && !isDriver) {
-          return res.status(403).json({
-            success: false,
-            error: "Not authorized to join this ride channel"
-          });
-        }
-      } catch (authError) {
-        console.log("calls/token auth check error:", authError?.message || authError);
-        // Fail closed for ride channels if we couldn't verify
-        return res.status(500).json({
-          success: false,
-          error: "Could not verify channel authorization"
-        });
-      }
     }
-    // ---- end authorization ----
+  }
+  await rtdb.ref().update(updates);
+  return next;
+}
 
-    const expireSeconds = 3600;
+// ---- remove a finished call's copies shortly after clients have seen the end ----
+function scheduleCallCleanup(call) {
+  setTimeout(async () => {
+    try {
+      for (const pid of [call.callerId, call.receiverId]) {
+        const snap = await rtdb.ref(`user_calls/${pid}`).once("value");
+        const copy = snap.val();
+        if (copy && copy.callId === call.callId && !["ringing", "active"].includes(copy.status)) {
+          await rtdb.ref(`user_calls/${pid}`).remove();
+        }
+      }
+      await rtdb.ref(`calls/${call.callId}`).remove();
+    } catch (e) {
+      console.log("scheduleCallCleanup error", e?.message || e);
+    }
+  }, 15000);
+}
 
-    const token = RtcTokenBuilder.buildTokenWithUserAccount(
-      appId,
-      appCertificate,
-      channelName,
-      uid,
-      RtcRole.PUBLISHER,
-      expireSeconds,
-      expireSeconds
-    );
+async function finishCall(call, status, endReason) {
+  const done = await applyCallUpdate(call, {
+    status,
+    endReason: endReason || null,
+    endedAt: admin.database.ServerValue.TIMESTAMP
+  });
+  scheduleCallCleanup(done);
+  return done;
+}
 
-    return res.json({
-      success: true,
-      token,
-      appId,
-      channelName,
-      uid,
-      expiresAt: Date.now() + expireSeconds * 1000
+async function loadCall(callId) {
+  if (!callId) return null;
+  const snap = await rtdb.ref(`calls/${callId}`).once("value");
+  const call = snap.val();
+  return call ? { ...call, callId } : null;
+}
+
+// ---- best-effort push to the receiver (works only if they have a stored FCM token) ----
+async function pushIncomingCall(receiverId, receiverIsDriver, callerName, callId, orderId) {
+  try {
+    const doc = await db.collection(receiverIsDriver ? "drivers" : "users").doc(receiverId).get();
+    if (!doc.exists) return;
+    const d = doc.data() || {};
+    const token = d.fcmToken || d.pushToken || d?.profile?.fcmToken || null;
+    if (!token) return;
+    await sendPushNotification(token, "Incoming call", `${callerName} is calling you`, {
+      type: "incoming_call",
+      callId: String(callId),
+      orderId: String(orderId)
     });
+  } catch (e) {
+    console.log("pushIncomingCall error", e?.message || e);
+  }
+}
+
+/* ---------------------- START ---------------------- */
+app.post("/api/calls/start", async (req, res) => {
+  try {
+    const uid = await requireCallUser(req, res);
+    if (!uid) return;
+
+    const orderId = val(req.body && req.body.orderId);
+    if (!orderId) {
+      return res.status(400).json({ success: false, error: "Missing orderId" });
+    }
+
+    const orderDoc = await db.collection("orders").doc(orderId).get();
+    if (!orderDoc.exists) {
+      return res.status(404).json({ success: false, error: "Order not found" });
+    }
+    const od = orderDoc.data() || {};
+    const riderId = od.riderId || od.userId || od.customerId || null;
+    const driverId = od.driverId || null;
+
+    if (!riderId || !driverId) {
+      return res.status(409).json({ success: false, error: "No driver assigned to this order yet" });
+    }
+
+    const callerIsRider = uid === riderId;
+    const callerIsDriver = uid === driverId;
+    if (!callerIsRider && !callerIsDriver) {
+      return res.status(403).json({ success: false, error: "Not part of this order" });
+    }
+
+    if (!CALL_ORDER_STATUSES.includes(od.status)) {
+      return res.status(409).json({ success: false, error: "Calls are only available during an active trip" });
+    }
+
+    const receiverId = callerIsRider ? driverId : riderId;
+
+    // busy / duplicate check on both participants
+    for (const pid of [uid, receiverId]) {
+      const snap = await rtdb.ref(`user_calls/${pid}`).once("value");
+      const ex = snap.val();
+      if (!ex) continue;
+
+      const ringingLive = ex.status === "ringing" && Number(ex.expiresAt) > Date.now();
+      const activeLive =
+        ex.status === "active" &&
+        (!ex.startedAt || Date.now() - Number(ex.startedAt) < CALL_STALE_ACTIVE_MS);
+
+      if (ringingLive && ex.orderId === orderId && ex.callerId === uid) {
+        // double tap: hand back the same call with a fresh token
+        const creds = buildCallCredentials(ex.channel, uid);
+        return res.json({ success: true, callId: ex.callId, expiresAt: ex.expiresAt, ...creds });
+      }
+      if (ringingLive || activeLive) {
+        return res.status(409).json({ success: false, error: "A call is already in progress" });
+      }
+    }
+
+    const callId = rtdb.ref("calls").push().key;
+    const channel = `call_${callId}`;
+    const callerName = callerIsRider
+      ? od.userName || "Customer"
+      : (od.driverSnapshot && od.driverSnapshot.firstName) || "Driver";
+    const receiverName = callerIsRider
+      ? (od.driverSnapshot && od.driverSnapshot.firstName) || "Driver"
+      : od.userName || "Customer";
+
+    const call = {
+      callId,
+      orderId,
+      channel,
+      callerId: uid,
+      receiverId,
+      callerRole: callerIsRider ? "rider" : "driver",
+      callerName,
+      receiverName,
+      status: "ringing",
+      createdAt: admin.database.ServerValue.TIMESTAMP,
+      expiresAt: Date.now() + CALL_RING_MS,
+      startedAt: null,
+      endedAt: null,
+      endReason: null
+    };
+
+    const creds = buildCallCredentials(channel, uid);
+
+    await rtdb.ref().update({
+      [`calls/${callId}`]: call,
+      [`user_calls/${uid}`]: callCopyFor(call, uid),
+      [`user_calls/${receiverId}`]: callCopyFor(call, receiverId)
+    });
+
+    pushIncomingCall(receiverId, callerIsRider, callerName, callId, orderId);
+
+    return res.json({ success: true, callId, expiresAt: call.expiresAt, ...creds });
   } catch (error) {
-    console.error("Error in /api/calls/token:", error);
+    console.error("Error in /api/calls/start:", error);
     return res.status(500).json({ success: false, error: error.message });
   }
 });
+
+/* ---------------------- ACCEPT ---------------------- */
+app.post("/api/calls/accept", async (req, res) => {
+  try {
+    const uid = await requireCallUser(req, res);
+    if (!uid) return;
+
+    const call = await loadCall(val(req.body && req.body.callId));
+    if (!call) return res.status(404).json({ success: false, error: "Call not found" });
+    if (call.receiverId !== uid) {
+      return res.status(403).json({ success: false, error: "Not your call to answer" });
+    }
+    if (call.status !== "ringing" || Number(call.expiresAt) <= Date.now()) {
+      return res.status(409).json({ success: false, error: "Call is no longer ringing" });
+    }
+
+    const creds = buildCallCredentials(call.channel, uid);
+    await applyCallUpdate(call, {
+      status: "active",
+      startedAt: admin.database.ServerValue.TIMESTAMP
+    });
+
+    return res.json({ success: true, callId: call.callId, ...creds });
+  } catch (error) {
+    console.error("Error in /api/calls/accept:", error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/* ---------------------- DECLINE ---------------------- */
+app.post("/api/calls/decline", async (req, res) => {
+  try {
+    const uid = await requireCallUser(req, res);
+    if (!uid) return;
+
+    const call = await loadCall(val(req.body && req.body.callId));
+    if (!call) return res.json({ success: true });
+    if (call.receiverId !== uid) {
+      return res.status(403).json({ success: false, error: "Not your call" });
+    }
+    if (call.status === "ringing") {
+      await finishCall(call, "declined", "declined");
+    }
+    return res.json({ success: true });
+  } catch (error) {
+    console.error("Error in /api/calls/decline:", error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/* ---------------------- END ---------------------- */
+app.post("/api/calls/end", async (req, res) => {
+  try {
+    const uid = await requireCallUser(req, res);
+    if (!uid) return;
+
+    const call = await loadCall(val(req.body && req.body.callId));
+    if (!call) return res.json({ success: true });
+    if (call.callerId !== uid && call.receiverId !== uid) {
+      return res.status(403).json({ success: false, error: "Not your call" });
+    }
+    if (call.status !== "ringing" && call.status !== "active") {
+      return res.json({ success: true }); // already finished
+    }
+
+    const reason = val(req.body && req.body.reason);
+    if (call.status === "ringing") {
+      if (reason === "no_answer") await finishCall(call, "missed", "no_answer");
+      else await finishCall(call, "ended", "cancelled");
+    } else {
+      await finishCall(call, "ended", "hangup");
+    }
+    return res.json({ success: true });
+  } catch (error) {
+    console.error("Error in /api/calls/end:", error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/* ---------- called when an order completes/cancels (see listener hook) ---------- */
+async function endCallsForOrder(orderId, orderData) {
+  try {
+    const ids = [orderData.riderId, orderData.userId, orderData.customerId, orderData.driverId].filter(Boolean);
+    for (const pid of [...new Set(ids)]) {
+      const snap = await rtdb.ref(`user_calls/${pid}`).once("value");
+      const copy = snap.val();
+      if (copy && copy.orderId === orderId && (copy.status === "ringing" || copy.status === "active")) {
+        const call = await loadCall(copy.callId);
+        if (call) await finishCall(call, "ended", "trip_ended");
+      }
+    }
+  } catch (e) {
+    console.log("endCallsForOrder error", e?.message || e);
+  }
+}
 
 /* =======================================================
    🔥 RTDB REQUEST STATUS SYNC
@@ -2998,6 +3237,9 @@ db.collection("orders")
           await removeRequestFromAllDrivers(
             orderId
           );
+
+          // NEW: end any active call associated with this order
+          await endCallsForOrder(orderId, data);
         }
       }
     }
