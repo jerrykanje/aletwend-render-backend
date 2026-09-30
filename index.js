@@ -752,18 +752,16 @@ app.post("/api/calls/token", async (req, res) => {
     }
     // ---- end authorization ----
 
-    const expireSeconds = 3600; // token valid for 1 hour
-    const currentTimestamp = Math.floor(Date.now() / 1000);
-    const privilegeExpireTs = currentTimestamp + expireSeconds;
+    const expireSeconds = 3600;
 
-    // FIX: use buildTokenWithAccount (string user IDs), not buildTokenWithUid
-    const token = RtcTokenBuilder.buildTokenWithAccount(
+    const token = RtcTokenBuilder.buildTokenWithUserAccount(
       appId,
       appCertificate,
       channelName,
       uid,
       RtcRole.PUBLISHER,
-      privilegeExpireTs
+      expireSeconds,
+      expireSeconds
     );
 
     return res.json({
@@ -771,8 +769,8 @@ app.post("/api/calls/token", async (req, res) => {
       token,
       appId,
       channelName,
-      uid, // echoed back as the same string
-      expiresAt: privilegeExpireTs * 1000
+      uid,
+      expiresAt: Date.now() + expireSeconds * 1000
     });
   } catch (error) {
     console.error("Error in /api/calls/token:", error);
