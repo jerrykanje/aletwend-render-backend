@@ -1,4 +1,4 @@
- const express = require("express");
+const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 const axios = require("axios");
@@ -789,10 +789,14 @@ function scheduleCallCleanup(call) {
 }
 
 async function finishCall(call, status, endReason) {
+  // Talk time only exists if the call was actually answered (startedAt is set on accept).
+  const answeredAt = Number(call.startedAt) || 0;
+  const durationSeconds = answeredAt ? Math.max(0, Math.floor((Date.now() - answeredAt) / 1000)) : 0;
   const done = await applyCallUpdate(call, {
     status,
     endReason: endReason || null,
-    endedAt: admin.database.ServerValue.TIMESTAMP
+    endedAt: admin.database.ServerValue.TIMESTAMP,
+    durationSeconds
   });
   scheduleCallCleanup(done);
   return done;
@@ -987,9 +991,23 @@ app.post("/api/calls/end", async (req, res) => {
     }
 
     const reason = val(req.body && req.body.reason);
+
+    // A late "no_answer" from a client ring-timer must NEVER hang up a call that was answered.
+    if (reason === "no_answer" && call.status === "active") {
+      return res.json({ success: true, ignored: true });
+    }
+    // "no_answer" is only valid once the ring window has really expired, and only from the caller.
+    if (reason === "no_answer" && call.status === "ringing") {
+      if (uid !== call.callerId || Number(call.expiresAt) > Date.now() + 2000) {
+        return res.json({ success: true, ignored: true });
+      }
+      await finishCall(call, "missed", "no_answer");
+      return res.json({ success: true });
+    }
+
     if (call.status === "ringing") {
-      if (reason === "no_answer") await finishCall(call, "missed", "no_answer");
-      else await finishCall(call, "ended", "cancelled");
+      // Caller cancelled before the other side answered
+      await finishCall(call, "ended", uid === call.callerId ? "cancelled" : "declined");
     } else {
       await finishCall(call, "ended", "hangup");
     }
