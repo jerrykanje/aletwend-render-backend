@@ -1,4 +1,4 @@
-const express = require("express");
+ const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 const axios = require("axios");
@@ -809,31 +809,227 @@ async function loadCall(callId) {
   return call ? { ...call, callId } : null;
 }
 
-// ---- best-effort push to the receiver (works only if they have a stored FCM token) ----
-async function pushIncomingCall(receiverId, receiverIsDriver, callerName, callId, orderId) {
+// Store <-> customer calls (Shop & Market stores only): before a driver is being searched for.
+const STORE_CUSTOMER_STATUSES = ["pending", "accepted", "ready_for_pickup"];
+const STORE_CUSTOMER_DRIVER_STATUSES = ["waiting", "no_driver_found", ""];
+// Store <-> driver calls: from driver_assigned until pickup.
+const STORE_DRIVER_STATUSES = ["driver_assigned", "at_store"];
+const STORE_DRIVER_DRIVER_STATUSES = ["assigned", "at_store"];
+const STORE_ORDER_WORKFLOWS = ["store_delivery", "delivery"];
+const STORE_REMIND_EVERY_MS = 60 * 1000;
+const STORE_REMIND_MAX = 8;
+const STORE_ALERT_MAX_AGE_MS = 15 * 60 * 1000;
+
+// ---- small helpers ----
+function toMillis(v) {
+  if (!v) return 0;
+  if (typeof v.toMillis === "function") return v.toMillis();
+  if (v instanceof Date) return v.getTime();
+  if (typeof v === "number") return v;
+  const t = Date.parse(v);
+  return Number.isNaN(t) ? 0 : t;
+}
+
+function orderLabel(orderId, data) {
+  return (data && data.orderId) || String(orderId).slice(-5).toUpperCase();
+}
+
+const PUSH_COLLECTION = { rider: "users", driver: "drivers", store: "stores" };
+
+const CALLABLE_SHOP_CATEGORIES = ["market", "small_shop"];
+
+async function isMarketStore(storeId) { const snap = await db.collection("stores").doc(storeId).get(); return snap.exists && CALLABLE_SHOP_CATEGORIES.includes(val((snap.data() || {}).category)); }
+
+// ---- all FCM tokens a person has (store owners may be signed in on several devices) ----
+async function getPushTokens(collection, id) {
+  const doc = await db.collection(collection).doc(id).get();
+  if (!doc.exists) return [];
+  const d = doc.data() || {};
+  const list = [];
+  if (Array.isArray(d.fcmTokens)) list.push(...d.fcmTokens);
+  [d.fcmToken, d.pushToken, d.profile && d.profile.fcmToken].forEach((t) => t && list.push(t));
+  return [...new Set(list.filter((t) => typeof t === "string" && t.length > 20))];
+}
+
+// ---- loud, high-priority push to a store owner (all devices); prunes dead tokens ----
+async function pushToStore(storeId, { title, body, data = {}, ttlMs = 120000 }) {
   try {
-    const doc = await db.collection(receiverIsDriver ? "drivers" : "users").doc(receiverId).get();
-    if (!doc.exists) return;
-    const d = doc.data() || {};
-    const token = d.fcmToken || d.pushToken || d?.profile?.fcmToken || null;
-    if (!token) return;
-    await sendPushNotification(token, "Incoming call", `${callerName} is calling you`, {
-      type: "incoming_call",
-      callId: String(callId),
-      orderId: String(orderId)
+    const tokens = await getPushTokens("stores", storeId);
+    if (!tokens.length) return 0;
+    const stringData = Object.fromEntries(Object.entries({ ...data, title, body }).map(([k, v]) => [k, String(v)]));
+    let sent = 0;
+    for (const token of tokens) {
+      try {
+        await admin.messaging().send({
+          token,
+          notification: { title, body },
+          data: stringData,
+          android: {
+            priority: "high",
+            ttl: ttlMs,
+            notification: { channelId: "new_orders", sound: "order", priority: "max" }
+          },
+          apns: {
+            headers: { "apns-priority": "10" },
+            payload: { aps: { sound: "order.caf", "interruption-level": "time-sensitive" } }
+          },
+          webpush: {
+            headers: { Urgency: "high", TTL: String(Math.floor(ttlMs / 1000)) },
+            ...(process.env.STORE_APP_URL ? { fcmOptions: { link: process.env.STORE_APP_URL } } : {})
+          }
+        });
+        sent++;
+      } catch (e) {
+        const code = (e && e.code) || "";
+        if (code.includes("registration-token-not-registered") || code.includes("invalid-registration-token")) {
+          await db.collection("stores").doc(storeId).update({
+            fcmTokens: admin.firestore.FieldValue.arrayRemove(token)
+          }).catch(() => {});
+        } else {
+          console.log("pushToStore error", code || e?.message || e);
+        }
+      }
+    }
+    return sent;
+  } catch (e) {
+    console.log("pushToStore failed", e?.message || e);
+    return 0;
+  }
+}
+
+/* ---------------- NEW ORDER ALERT (exactly once per order) ---------------- */
+async function notifyStoreNewOrder(orderId, data) {
+  try {
+    if (!data || !data.storeId) return;
+    if (!STORE_ORDER_WORKFLOWS.includes(val(data.workflowType))) return;
+    if (data.status !== "pending") return;
+    if (data.storeNotifiedAt) return;
+    const createdMs = toMillis(data.createdAt);
+    if (createdMs && Date.now() - createdMs > STORE_ALERT_MAX_AGE_MS) return; // stale: never blast on restart
+
+    const ref = db.collection("orders").doc(orderId);
+    const won = await db.runTransaction(async (t) => {
+      const snap = await t.get(ref);
+      const d = snap.data() || {};
+      if (d.storeNotifiedAt || d.status !== "pending") return false;
+      t.update(ref, { storeNotifiedAt: Date.now(), storeRemindCount: 0 });
+      return true;
     });
+    if (!won) return;
+
+    await pushToStore(data.storeId, {
+      title: "New order! 🛎️",
+      body: `Order #${orderLabel(orderId, data)} from ${data.userName || "a customer"} is waiting. Tap to accept.`,
+      data: { type: "new_order", orderId: String(orderId) }
+    });
+  } catch (e) {
+    console.log("notifyStoreNewOrder error", e?.message || e);
+  }
+}
+
+/* ---------------- ORDER CANCELLED BY THE CUSTOMER (once per order) ---------------- */
+async function notifyStoreOrderCancelled(orderId, data) {
+  try {
+    if (!data || !data.storeId || data.status !== "cancelled") return;
+    if (!data.storeNotifiedAt || data.storeCancelNotifiedAt) return; // store never saw it, or already told
+    const cancelledMs = toMillis(data.cancelledAt);
+    if (cancelledMs && Date.now() - cancelledMs > STORE_ALERT_MAX_AGE_MS) return;
+
+    const ref = db.collection("orders").doc(orderId);
+    const won = await db.runTransaction(async (t) => {
+      const snap = await t.get(ref);
+      const d = snap.data() || {};
+      if (d.storeCancelNotifiedAt || d.status !== "cancelled") return false;
+      t.update(ref, { storeCancelNotifiedAt: Date.now() });
+      return true;
+    });
+    if (!won) return;
+
+    const reason = val(data.cancellationReason).trim();
+    await pushToStore(data.storeId, {
+      title: "Order cancelled",
+      body: `Order #${orderLabel(orderId, data)} was cancelled by the customer${reason ? ": " + reason : "."}`,
+      data: { type: "order_cancelled", orderId: String(orderId) }
+    });
+  } catch (e) {
+    console.log("notifyStoreOrderCancelled error", e?.message || e);
+  }
+}
+
+/* ---------------- REMINDERS until the store responds ---------------- */
+async function sweepStoreReminders() {
+  try {
+    const snap = await db.collection("orders").where("status", "==", "pending").get();
+    const nowMs = Date.now();
+    for (const doc of snap.docs) {
+      const o = doc.data() || {};
+      if (!o.storeId || !STORE_ORDER_WORKFLOWS.includes(val(o.workflowType))) continue;
+      if (!o.storeNotifiedAt) continue;
+      const createdMs = toMillis(o.createdAt);
+      if (createdMs && nowMs - createdMs > STORE_ALERT_MAX_AGE_MS) continue;
+      const count = Number(o.storeRemindCount) || 0;
+      if (count >= STORE_REMIND_MAX) continue;
+      const lastMs = Number(o.storeLastRemindAt) || Number(o.storeNotifiedAt) || 0;
+      if (nowMs - lastMs < STORE_REMIND_EVERY_MS) continue;
+
+      const won = await db.runTransaction(async (t) => {
+        const fresh = await t.get(doc.ref);
+        const d = fresh.data() || {};
+        if (d.status !== "pending") return false;
+        if ((Number(d.storeRemindCount) || 0) !== count) return false;
+        t.update(doc.ref, { storeRemindCount: count + 1, storeLastRemindAt: nowMs });
+        return true;
+      });
+      if (!won) continue;
+
+      await pushToStore(o.storeId, {
+        title: "Order still waiting ⏰",
+        body: `Order #${orderLabel(doc.id, o)} has not been accepted yet. Customer is waiting.`,
+        data: { type: "order_reminder", orderId: String(doc.id) }
+      });
+    }
+  } catch (e) {
+    console.log("sweepStoreReminders error", e?.message || e);
+  }
+}
+
+function startStoreReminderSweep() {
+  setInterval(sweepStoreReminders, 30 * 1000);
+}
+
+/* ---------------- push to a call receiver (rider / driver / store) ---------------- */
+async function pushIncomingCall(receiverId, receiverRole, callerName, callId, orderId) {
+  try {
+    if (receiverRole === "store") {
+      await pushToStore(receiverId, {
+        title: "Incoming call 📞",
+        body: `${callerName} is calling you`,
+        data: { type: "incoming_call", callId: String(callId), orderId: String(orderId) },
+        ttlMs: CALL_RING_MS
+      });
+      return;
+    }
+    const tokens = await getPushTokens(PUSH_COLLECTION[receiverRole] || "users", receiverId);
+    for (const token of tokens) {
+      await sendPushNotification(token, "Incoming call", `${callerName} is calling you`, {
+        type: "incoming_call",
+        callId: String(callId),
+        orderId: String(orderId)
+      });
+    }
   } catch (e) {
     console.log("pushIncomingCall error", e?.message || e);
   }
 }
 
-/* ---------------------- START ---------------------- */
+/* ---------------------- START (rider<->driver, store<->customer, store<->driver) ---------------------- */
 app.post("/api/calls/start", async (req, res) => {
   try {
     const uid = await requireCallUser(req, res);
     if (!uid) return;
 
     const orderId = val(req.body && req.body.orderId);
+    const target = val(req.body && req.body.target); // driver app sends "store" to call the store
     if (!orderId) {
       return res.status(400).json({ success: false, error: "Missing orderId" });
     }
@@ -845,22 +1041,69 @@ app.post("/api/calls/start", async (req, res) => {
     const od = orderDoc.data() || {};
     const riderId = od.riderId || od.userId || od.customerId || null;
     const driverId = od.driverId || null;
+    const storeId = od.storeId || null;
 
-    if (!riderId || !driverId) {
-      return res.status(409).json({ success: false, error: "No driver assigned to this order yet" });
-    }
-
-    const callerIsRider = uid === riderId;
-    const callerIsDriver = uid === driverId;
-    if (!callerIsRider && !callerIsDriver) {
+    const callerIsRider = !!riderId && uid === riderId;
+    const callerIsDriver = !!driverId && uid === driverId;
+    const callerIsStore = !!storeId && uid === storeId;
+    if (!callerIsRider && !callerIsDriver && !callerIsStore) {
       return res.status(403).json({ success: false, error: "Not part of this order" });
     }
 
-    if (!CALL_ORDER_STATUSES.includes(od.status)) {
-      return res.status(409).json({ success: false, error: "Calls are only available during an active trip" });
-    }
+    const status = val(od.status);
+    const driverStatus = val(od.driverStatus);
+    const isStoreOrder = !!storeId && STORE_ORDER_WORKFLOWS.includes(val(od.workflowType));
+    const inCustomerWindow =
+      isStoreOrder &&
+      STORE_CUSTOMER_STATUSES.includes(status) &&
+      STORE_CUSTOMER_DRIVER_STATUSES.includes(driverStatus);
+    const inDriverWindow =
+      isStoreOrder &&
+      !!driverId &&
+      STORE_DRIVER_STATUSES.includes(status) &&
+      STORE_DRIVER_DRIVER_STATUSES.includes(driverStatus);
+    const STORE_CALL_MESSAGE =
+      "Store calls are only available before a driver is searched for (Shop & Market stores) or while the driver is on the way to, or at, the store";
 
-    const receiverId = callerIsRider ? driverId : riderId;
+    let callerRole;
+    let receiverRole;
+    let receiverId;
+
+    if (callerIsStore) {
+      if (inCustomerWindow) {
+        if (!riderId) return res.status(409).json({ success: false, error: "No customer on this order" });
+        if (!(await isMarketStore(storeId))) {
+          return res.status(409).json({ success: false, error: "Customer calls are only available for Shop & Market stores" });
+        }
+        callerRole = "store"; receiverRole = "rider"; receiverId = riderId;
+      } else if (inDriverWindow) {
+        callerRole = "store"; receiverRole = "driver"; receiverId = driverId;
+      } else {
+        return res.status(409).json({ success: false, error: STORE_CALL_MESSAGE });
+      }
+    } else if (callerIsRider) {
+      if (inCustomerWindow && (await isMarketStore(storeId))) {
+        callerRole = "rider"; receiverRole = "store"; receiverId = storeId;
+      } else {
+        if (!driverId) return res.status(409).json({ success: false, error: "No driver assigned to this order yet" });
+        if (!CALL_ORDER_STATUSES.includes(status)) {
+          return res.status(409).json({ success: false, error: "Calls are only available during an active trip" });
+        }
+        callerRole = "rider"; receiverRole = "driver"; receiverId = driverId;
+      }
+    } else {
+      // caller is the driver
+      if (target === "store") {
+        if (!inDriverWindow) return res.status(409).json({ success: false, error: STORE_CALL_MESSAGE });
+        callerRole = "driver"; receiverRole = "store"; receiverId = storeId;
+      } else {
+        if (!riderId) return res.status(409).json({ success: false, error: "No customer on this order" });
+        if (!CALL_ORDER_STATUSES.includes(status)) {
+          return res.status(409).json({ success: false, error: "Calls are only available during an active trip" });
+        }
+        callerRole = "driver"; receiverRole = "rider"; receiverId = riderId;
+      }
+    }
 
     // busy / duplicate check on both participants
     for (const pid of [uid, receiverId]) {
@@ -874,7 +1117,6 @@ app.post("/api/calls/start", async (req, res) => {
         (!ex.startedAt || Date.now() - Number(ex.startedAt) < CALL_STALE_ACTIVE_MS);
 
       if (ringingLive && ex.orderId === orderId && ex.callerId === uid) {
-        // double tap: hand back the same call with a fresh token
         const creds = buildCallCredentials(ex.channel, uid);
         return res.json({ success: true, callId: ex.callId, expiresAt: ex.expiresAt, ...creds });
       }
@@ -883,22 +1125,24 @@ app.post("/api/calls/start", async (req, res) => {
       }
     }
 
+    const nameOf = {
+      rider: od.userName || "Customer",
+      driver: (od.driverSnapshot && od.driverSnapshot.firstName) || "Driver",
+      store: od.storeName || "Store"
+    };
+    const callerName = nameOf[callerRole];
+    const receiverName = nameOf[receiverRole];
+
     const callId = rtdb.ref("calls").push().key;
     const channel = `call_${callId}`;
-    const callerName = callerIsRider
-      ? od.userName || "Customer"
-      : (od.driverSnapshot && od.driverSnapshot.firstName) || "Driver";
-    const receiverName = callerIsRider
-      ? (od.driverSnapshot && od.driverSnapshot.firstName) || "Driver"
-      : od.userName || "Customer";
-
     const call = {
       callId,
       orderId,
       channel,
       callerId: uid,
       receiverId,
-      callerRole: callerIsRider ? "rider" : "driver",
+      callerRole,
+      receiverRole,
       callerName,
       receiverName,
       status: "ringing",
@@ -917,7 +1161,7 @@ app.post("/api/calls/start", async (req, res) => {
       [`user_calls/${receiverId}`]: callCopyFor(call, receiverId)
     });
 
-    pushIncomingCall(receiverId, callerIsRider, callerName, callId, orderId);
+    pushIncomingCall(receiverId, receiverRole, callerName, callId, orderId);
 
     return res.json({ success: true, callId, expiresAt: call.expiresAt, ...creds });
   } catch (error) {
@@ -1018,10 +1262,16 @@ app.post("/api/calls/end", async (req, res) => {
   }
 });
 
-/* ---------- called when an order completes/cancels (see listener hook) ---------- */
+/* ---------- called when an order completes/cancels (rider, driver AND store) ---------- */
 async function endCallsForOrder(orderId, orderData) {
   try {
-    const ids = [orderData.riderId, orderData.userId, orderData.customerId, orderData.driverId].filter(Boolean);
+    const ids = [
+      orderData.riderId,
+      orderData.userId,
+      orderData.customerId,
+      orderData.driverId,
+      orderData.storeId
+    ].filter(Boolean);
     for (const pid of [...new Set(ids)]) {
       const snap = await rtdb.ref(`user_calls/${pid}`).once("value");
       const copy = snap.val();
@@ -1899,6 +2149,13 @@ function calculateFare(
   );
 }
 
+const DRIVER_SEARCH_RADIUS_KM = 7;
+const DELIVERY_FAMILY = ["courier", "package", "delivery"];
+
+const VEHICLE_CAPACITY_KG = { delivery_bicycle: 8, delivery_motorbike: 25, delivery_car: 200, open_truck: 5000, closed_truck: 5000, delivery_truck: 5000 };
+
+function vehicleCapacityKg(vehicle) { const type = val(vehicle && vehicle.type).toLowerCase(); if (type === "bicycle") return 8; if (type === "motorbike") return 25; if (type === "car") return 200; if (type === "truck") return (Number(vehicle.tonnage) || 5) * 1000; return 200; }
+
 /* =======================================================
    🔥 FIND MATCHING DRIVER (FIX 3: PARALLEL ORS)
 ======================================================= */
@@ -2016,6 +2273,9 @@ async function findMatchingDriver(
           !matched
         ) return;
 
+        const totalKg = Number(orderData.totalKg) || 0;
+        if (totalKg > 0 && vehicleCapacityKg(d.vehicle) < totalKg) return;
+
         const lat =
           Number(
             locations[
@@ -2043,7 +2303,7 @@ async function findMatchingDriver(
           );
 
         if (
-          distance > 15
+          distance > DRIVER_SEARCH_RADIUS_KM
         ) return;
 
         matches.push({
@@ -2758,6 +3018,14 @@ app.post(
         // NEW: notify rider that a driver accepted
         notifyRider("Driver is on the way", "Your driver has accepted your trip and is heading to pickup.");
 
+        if (orderData.storeId && STORE_ORDER_WORKFLOWS.includes(workflowType)) {
+          pushToStore(orderData.storeId, {
+            title: "Driver assigned 🚗",
+            body: `${(driverSnapshot && driverSnapshot.firstName) || "A driver"} is coming to pick up order #${orderLabel(orderId, orderData)}.`,
+            data: { type: "driver_assigned", orderId: String(orderId) }
+          });
+        }
+
         return res.json({
 
           success: true
@@ -2890,6 +3158,14 @@ app.post(
 
         // Stop pickup listener (driver reached store)
         stopPickupEtaListener(orderId);
+
+        if (orderData.storeId) {
+          pushToStore(orderData.storeId, {
+            title: "Driver has arrived 📦",
+            body: `The driver is at your store for order #${orderLabel(orderId, orderData)}.`,
+            data: { type: "driver_at_store", orderId: String(orderId) }
+          });
+        }
 
         return res.json({
 
@@ -3155,6 +3431,11 @@ db.collection("orders")
             data.driverStatus
           );
 
+        if (change.type === "added" || change.type === "modified") {
+          notifyStoreNewOrder(orderId, data);
+          notifyStoreOrderCancelled(orderId, data);
+        }
+
         if (
 
           (
@@ -3266,131 +3547,151 @@ db.collection("orders")
 /* =======================================================
    🚕 GET RIDE OPTIONS (FIX 4: stops, parallel pricing, polyline)
 ======================================================= */
-app.post("/getRideOptions", async (req, res) => {
-  try {
-    const body = req.body || {};
-    const pickupLat = Number(body.pickupLat);
-    const pickupLng = Number(body.pickupLng);
-    const dropLat = Number(body.dropLat);
-    const dropLng = Number(body.dropLng);
-    const serviceType = (body.serviceType || "ride").toLowerCase();
+app.post("/getRideOptions", async (req, res) => { try { const body = req.body || {}; const pickupLat = Number(body.pickupLat); const pickupLng = Number(body.pickupLng); const dropLat = Number(body.dropLat); const dropLng = Number(body.dropLng); const serviceType = (body.serviceType || "ride").toLowerCase(); const totalKg = Math.max(0, Number(body.totalKg) || 0); const isDeliveryFamily = DELIVERY_FAMILY.includes(serviceType);
 
-    // Extract stops with real coordinates
-    const stops = (Array.isArray(body.stops) ? body.stops : []).filter(
-      s => s && Number(s.lat) !== 0 && Number(s.lng) !== 0
-    );
+const stops = (Array.isArray(body.stops) ? body.stops : []).filter(
+  s => s && Number(s.lat) !== 0 && Number(s.lng) !== 0
+);
 
-    // Get route (with stops if any) — ONE ORS call for the whole trip
-    const tripRoute = await getRouteDataWithFallback(pickupLat, pickupLng, dropLat, dropLng, stops);
-    const tripKm = tripRoute.distanceKm;
-    const tripDurationMinutes = tripRoute.durationMinutes;
-    const tripEncodedPolyline = tripRoute.encodedPolyline;  // same polyline for all vehicle cards
+const tripRoute = await getRouteDataWithFallback(pickupLat, pickupLng, dropLat, dropLng, stops);
+const tripKm = tripRoute.distanceKm;
+const tripDurationMinutes = tripRoute.durationMinutes;
+const tripEncodedPolyline = tripRoute.encodedPolyline;
 
-    let categories = [];
+let categories = [];
+if (serviceType === "ride") {
+  categories = ["economy", "comfort", "premium", "women", "aletwende", "xl", "xxl"];
+}
+if (serviceType === "courier" || serviceType === "package") {
+  categories = ["delivery_bicycle", "delivery_motorbike", "delivery_car"];
+  if (totalKg > VEHICLE_CAPACITY_KG.delivery_car) categories.push("open_truck", "closed_truck");
+}
+if (serviceType === "delivery") {
+  categories = ["delivery_bicycle", "delivery_motorbike", "delivery_car", "open_truck", "closed_truck"];
+}
+if (serviceType === "delivery_truck") {
+  categories = ["delivery_truck"];
+}
 
-    if (serviceType === "ride") {
-      categories = ["economy", "comfort", "premium", "women", "aletwende", "xl", "xxl"];
-    }
+const onlineSnap = await rtdb.ref("drivers_online").once("value");
+const locationSnap = await rtdb.ref("driver_locations").once("value");
+const online = onlineSnap.val() || {};
+const locations = locationSnap.val() || {};
+const driversSnap = await db.collection("drivers").get();
 
-    if (serviceType === "courier" || serviceType === "package") {
-      categories = ["delivery_bicycle", "delivery_motorbike", "delivery_car"];
-    }
+const drivers = [];
+let onlineFree = 0;
 
-    if (serviceType === "delivery") {
-      categories = ["delivery_bicycle", "delivery_motorbike", "delivery_car", "open_truck", "closed_truck"];
-    }
+driversSnap.forEach((doc) => {
+  const d = doc.data() || {};
+  const uid = d.uid || doc.id;
+  if (!uid) return;
+  if (!online[uid]?.isOnline) return;
+  if (online[uid]?.isBusy) return;
+  if (!locations[uid]?.l) return;
+  if (!d.vehicle) return;
 
-    if (serviceType === "delivery_truck") {
-      categories = ["delivery_truck"];
-    }
+  const services = Array.isArray(d.vehicle.services) ? d.vehicle.services : [];
+  const vehicleCategory = Array.isArray(d.vehicle.vehicleCategory) ? d.vehicle.vehicleCategory : [];
+  const pricingCategory = Array.isArray(d.vehicle.pricingCategory) ? d.vehicle.pricingCategory : [];
 
-    const onlineSnap = await rtdb.ref("drivers_online").once("value");
-    const locationSnap = await rtdb.ref("driver_locations").once("value");
+  if (!isDeliveryFamily && !services.includes(serviceType)) return;
 
-    const online = onlineSnap.val() || {};
-    const locations = locationSnap.val() || {};
+  onlineFree++;
 
-    const driversSnap = await db.collection("drivers").get();
+  const lat = Number(locations[uid].l[0]);
+  const lng = Number(locations[uid].l[1]);
+  const distance = haversine(pickupLat, pickupLng, lat, lng);
+  if (distance > DRIVER_SEARCH_RADIUS_KM) return;
 
-    const drivers = [];
-
-    driversSnap.forEach((doc) => {
-      const d = doc.data() || {};
-      const uid = d.uid || doc.id;
-
-      if (!uid) return;
-      if (!online[uid]?.isOnline) return;
-      if (online[uid]?.isBusy) return;
-      if (!locations[uid]?.l) return;
-      if (!d.vehicle) return;
-      if (!d.vehicle.services.includes(serviceType)) return;
-
-      const lat = Number(locations[uid].l[0]);
-      const lng = Number(locations[uid].l[1]);
-      const distance = haversine(pickupLat, pickupLng, lat, lng);
-      if (distance > 7) return;
-
-      drivers.push({ uid, distance, vehicle: d.vehicle });
-    });
-
-    // First pass: find matching driver per category (sync, no async needed)
-    const categoryMatches = categories.map(category => {
-      const match = drivers.find(d => d.vehicle.vehicleCategory.includes(category));
-      if (!match) return { category, match: null, pricingKey: null };
-      const pricingKey =
-        match.vehicle.pricingCategory.find(p => p.includes(category)) ||
-        match.vehicle.pricingCategory[0];
-      return { category, match, pricingKey };
-    });
-
-    // Fetch all pricing docs in parallel
-    const pricingResults = await Promise.all(
-      categoryMatches.map(({ pricingKey }) =>
-        pricingKey ? db.collection("pricing").doc(pricingKey).get() : Promise.resolve(null)
-      )
-    );
-
-    // Build cards
-    const DISPLAY_NAMES = {
-      delivery_car: "Car", delivery_motorbike: "Motorbike", delivery_bicycle: "Bicycle",
-      open_truck: "Open Truck", closed_truck: "Closed Truck",
-      economy: "Economy", comfort: "Comfort", premium: "Premium", xl: "XL", xxl: "XXL"
-    };
-
-    const cards = categoryMatches.map(({ category, match, pricingKey }, i) => {
-      if (!match) {
-        return {
-          category, title: DISPLAY_NAMES[category] || category,
-          enabled: false, eta: null, price: null, seats: null,
-          image: `${category}.png`,
-          distanceKm: null, durationMinutes: null, encodedPolyline: null
-        };
-      }
-
-      const pricingDoc = pricingResults[i];
-      const baseFare = pricingDoc?.exists ? (pricingDoc.data().baseFare || 40) : 40;
-      const driverEtaMinutes = Math.max(2, Math.round(match.distance * 2));
-      const price = calculateFare(baseFare, tripKm);
-
-      return {
-        category, title: DISPLAY_NAMES[category] || category,
-        dispatchService: pricingKey, pricingCategory: pricingKey,
-        enabled: true, eta: driverEtaMinutes, price,
-        seats: serviceType === "ride" ? (match.vehicle.maxSeats || 4) : null,
-        image: `${category}.png`,
-        distanceKm: tripKm,
-        durationMinutes: tripDurationMinutes,
-        encodedPolyline: tripEncodedPolyline   // same route polyline for all cards
-      };
-    });
-
-    return res.json(cards);
-
-  } catch (error) {
-    console.error("Error in /getRideOptions:", error);
-    return res.status(500).json({ error: error.message });
-  }
+  drivers.push({
+    uid,
+    distance,
+    capacityKg: vehicleCapacityKg(d.vehicle),
+    vehicle: { ...d.vehicle, services, vehicleCategory, pricingCategory }
+  });
 });
+
+drivers.sort((a, b) => a.distance - b.distance);
+
+const categoryMatches = categories.map(category => {
+  const capacityKg = isDeliveryFamily ? (VEHICLE_CAPACITY_KG[category] || null) : null;
+  const tooHeavy = !!capacityKg && totalKg > capacityKg;
+  if (tooHeavy) return { category, capacityKg, tooHeavy, match: null, pricingKey: null };
+
+  const match = drivers.find(d =>
+    d.vehicle.vehicleCategory.includes(category) &&
+    (!isDeliveryFamily || totalKg <= d.capacityKg)
+  );
+  if (!match) return { category, capacityKg, tooHeavy: false, match: null, pricingKey: null };
+
+  const pricingKey =
+    match.vehicle.pricingCategory.find(p => p.includes(category)) ||
+    match.vehicle.pricingCategory[0] ||
+    null;
+  return { category, capacityKg, tooHeavy: false, match, pricingKey };
+});
+
+const pricingResults = await Promise.all(
+  categoryMatches.map(({ pricingKey }) =>
+    pricingKey ? db.collection("pricing").doc(pricingKey).get() : Promise.resolve(null)
+  )
+);
+
+const DISPLAY_NAMES = {
+  delivery_car: "Car", delivery_motorbike: "Motorbike", delivery_bicycle: "Bicycle",
+  open_truck: "Open Truck", closed_truck: "Closed Truck",
+  economy: "Economy", comfort: "Comfort", premium: "Premium", xl: "XL", xxl: "XXL"
+};
+
+let cards = categoryMatches.map(({ category, capacityKg, tooHeavy, match, pricingKey }, i) => {
+  if (!match) {
+    return {
+      category, title: DISPLAY_NAMES[category] || category,
+      enabled: false, eta: null, price: null, seats: null,
+      image: `${category}.png`,
+      capacityKg, tooHeavy, recommended: false,
+      distanceKm: null, durationMinutes: null, encodedPolyline: null
+    };
+  }
+  const pricingDoc = pricingResults[i];
+  const baseFare = pricingDoc?.exists ? (pricingDoc.data().baseFare || 40) : 40;
+  const driverEtaMinutes = Math.max(2, Math.round(match.distance * 2));
+  const price = calculateFare(baseFare, tripKm);
+  return {
+    category, title: DISPLAY_NAMES[category] || category,
+    dispatchService: pricingKey, pricingCategory: pricingKey,
+    enabled: true, eta: driverEtaMinutes, price,
+    seats: serviceType === "ride" ? (match.vehicle.maxSeats || 4) : null,
+    image: `${category}.png`,
+    capacityKg, tooHeavy: false, recommended: false,
+    distanceKm: tripKm,
+    durationMinutes: tripDurationMinutes,
+    encodedPolyline: tripEncodedPolyline
+  };
+});
+
+if (isDeliveryFamily) {
+  const usable = cards
+    .filter(c => c.enabled && !c.tooHeavy)
+    .sort((a, b) => (a.capacityKg || 0) - (b.capacityKg || 0));
+  if (usable.length) usable[0].recommended = true;
+
+  const rank = (c) => (c.recommended ? 0 : c.enabled && !c.tooHeavy ? 1 : c.tooHeavy ? 3 : 2);
+  cards = cards.sort((a, b) => rank(a) - rank(b) || (a.capacityKg || 0) - (b.capacityKg || 0));
+
+  if (!usable.length) {
+    console.log("getRideOptions: no drivers", {
+      pickupLat, pickupLng, totalKg, serviceType,
+      onlineFreeDrivers: onlineFree, withinRadius: drivers.length,
+      radiusKm: DRIVER_SEARCH_RADIUS_KM
+    });
+  }
+}
+
+return res.json(cards);
+
+} catch (error) { console.error("Error in /getRideOptions:", error); return res.status(500).json({ error: error.message }); } });
 
 /* =======================================================
    🔄 NEW ENDPOINT: /reroutePolyline
@@ -3715,5 +4016,7 @@ app.listen(
     console.log(
       `Server running on port ${PORT}`
     );
+
+    startStoreReminderSweep();
   }
 );
