@@ -1,4 +1,4 @@
-const express = require("express");
+ const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 const axios = require("axios");
@@ -2009,6 +2009,34 @@ app.post(
           });
       }
 
+      // Validate coordinates are finite numbers
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+        return res.status(200).json({ success: true, ignored: true });
+      }
+
+      const nowTs = Date.now();
+
+      // Reject any fix that would imply > 45 m/s vs the stored one
+      try {
+        const prevSnap = await rtdb.ref(`driver_locations/${driverId}`).once("value");
+        const prev = prevSnap.val();
+        if (prev && Array.isArray(prev.l) && prev.l.length === 2) {
+          const prevLat = Number(prev.l[0]);
+          const prevLng = Number(prev.l[1]);
+          const prevT = Number(prev.t) || Number(prev.updatedAt) || 0;
+          if (Number.isFinite(prevLat) && Number.isFinite(prevLng) && prevT > 0) {
+            const distKm = haversine(prevLat, prevLng, lat, lng);
+            const dtSec = Math.max(0.001, (nowTs - prevT) / 1000);
+            const speed = (distKm * 1000) / dtSec;
+            if (speed > 45) {
+              return res.status(200).json({ success: true, ignored: true });
+            }
+          }
+        }
+      } catch (e) {
+        console.log("updateDriverLocation prev check error", e?.message || e);
+      }
+
       await rtdb
         .ref(
           `driver_locations/${driverId}`
@@ -2021,8 +2049,10 @@ app.post(
 
           lng,
 
+          t: nowTs,
+
           updatedAt:
-            Date.now()
+            nowTs
         });
 
       await db
@@ -2205,6 +2235,17 @@ function calculateFare(
 
 const DRIVER_SEARCH_RADIUS_KM = 7;
 const DELIVERY_FAMILY = ["courier", "package", "delivery"];
+const LOCATION_MAX_AGE_MS = 60 * 1000; // ignore drivers whose location is older than 60s
+const ETA_THROTTLE_MS = 15 * 1000;     // at most one ORS call every 15s per order
+const ETA_MIN_MOVE_M = 30;             // only recompute when driver moved > 30m
+const ETA_MAX_SPEED_MS = 45;           // reject jumps that imply > 45 m/s
+
+function locationIsFresh(loc) {
+  if (!loc) return false;
+  const t = Number(loc.t) || Number(loc.updatedAt) || 0;
+  if (!t) return false;
+  return (Date.now() - t) <= LOCATION_MAX_AGE_MS;
+}
 
 const VEHICLE_CAPACITY_KG = { delivery_bicycle: 8, delivery_motorbike: 25, delivery_car: 200, open_truck: 5000, closed_truck: 5000, delivery_truck: 5000 };
 
@@ -2295,6 +2336,8 @@ async function findMatchingDriver(
           !locations[uid]
             ?.l
         ) return;
+
+        if (!locationIsFresh(locations[uid])) return;
 
         if (
           !d.vehicle
@@ -2581,6 +2624,7 @@ async function dispatchOrder(orderId, orderData) {
       distanceKm: tripRouteData.distanceKm,
       durationMinutes: tripRouteData.durationMinutes,
       polyline: tripRouteData.encodedPolyline,                          // client reads: orderData.polyline
+      encodedPolyline: tripRouteData.encodedPolyline,
       driverToPickupDistanceKm: matchedDriver.driverToPickupDistanceKm || null,
       driverToPickupEtaMinutes: matchedDriver.driverToPickupEtaMinutes || null,
       driverToPickupPolyline: matchedDriver.driverToPickupEncodedPolyline || null  // client reads: orderData.driverToPickupPolyline
@@ -2633,6 +2677,7 @@ async function dispatchOrder(orderId, orderData) {
    🔥 LIVE ETA LISTENERS (NEW FEATURE)
 ======================================================= */
 const activeListeners = new Map(); // orderId → { off: Function }
+const etaState = new Map(); // orderId → { lastMs, lastLat, lastLng }
 
 function startPickupEtaListener(orderId, driverId, pickupLat, pickupLng, orderRef) {
   const key = `pickup_${orderId}`;
@@ -2642,16 +2687,50 @@ function startPickupEtaListener(orderId, driverId, pickupLat, pickupLng, orderRe
   const handler = locRef.on('value', async (snap) => {
     const loc = snap.val();
     if (!loc?.l) return;
-    const routeData = await getRouteData(loc.l[0], loc.l[1], pickupLat, pickupLng);
+
+    const lat = Number(loc.l[0]);
+    const lng = Number(loc.l[1]);
+    const locT = Number(loc.t) || Number(loc.updatedAt) || 0;
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+
+    const state = etaState.get(key) || { lastMs: 0, lastLat: null, lastLng: null };
+
+    // Reject jumps implying > 45 m/s from the previous sample
+    if (state.lastLat != null && state.lastLng != null && state.lastMs) {
+      const distKm = haversine(state.lastLat, state.lastLng, lat, lng);
+      const dtSec = Math.max(0.001, (Date.now() - state.lastMs) / 1000);
+      if ((distKm * 1000) / dtSec > ETA_MAX_SPEED_MS) return;
+    }
+
+    // Throttle: at most once per 15s per order
+    const nowMs = Date.now();
+    if (state.lastMs && (nowMs - state.lastMs) < ETA_THROTTLE_MS) {
+      return;
+    }
+
+    // Require > 30m movement since last computation
+    if (state.lastLat != null && state.lastLng != null) {
+      const movedM = haversine(state.lastLat, state.lastLng, lat, lng) * 1000;
+      if (movedM < ETA_MIN_MOVE_M) return;
+    }
+
+    const routeData = await getRouteData(lat, lng, pickupLat, pickupLng);
     if (routeData) {
       await orderRef.update({
         driverToPickupEtaMinutes: routeData.durationMinutes,
         driverToPickupDistanceKm: routeData.distanceKm,
       }).catch(() => {});
+      etaState.set(key, { lastMs: nowMs, lastLat: lat, lastLng: lng });
+    } else {
+      // Mark attempt time even on failure so we don't hammer ORS
+      etaState.set(key, { lastMs: nowMs, lastLat: lat, lastLng: lng });
     }
   });
 
-  activeListeners.set(key, () => locRef.off('value', handler));
+  activeListeners.set(key, () => {
+    locRef.off('value', handler);
+    etaState.delete(key);
+  });
 }
 
 function stopPickupEtaListener(orderId) {
@@ -2671,16 +2750,45 @@ function startTripEtaListener(orderId, driverId, dropLat, dropLng, orderRef) {
   const handler = locRef.on('value', async (snap) => {
     const loc = snap.val();
     if (!loc?.l) return;
-    const routeData = await getRouteData(loc.l[0], loc.l[1], dropLat, dropLng);
+
+    const lat = Number(loc.l[0]);
+    const lng = Number(loc.l[1]);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+
+    const state = etaState.get(key) || { lastMs: 0, lastLat: null, lastLng: null };
+
+    if (state.lastLat != null && state.lastLng != null && state.lastMs) {
+      const distKm = haversine(state.lastLat, state.lastLng, lat, lng);
+      const dtSec = Math.max(0.001, (Date.now() - state.lastMs) / 1000);
+      if ((distKm * 1000) / dtSec > ETA_MAX_SPEED_MS) return;
+    }
+
+    const nowMs = Date.now();
+    if (state.lastMs && (nowMs - state.lastMs) < ETA_THROTTLE_MS) {
+      return;
+    }
+
+    if (state.lastLat != null && state.lastLng != null) {
+      const movedM = haversine(state.lastLat, state.lastLng, lat, lng) * 1000;
+      if (movedM < ETA_MIN_MOVE_M) return;
+    }
+
+    const routeData = await getRouteData(lat, lng, dropLat, dropLng);
     if (routeData) {
       await orderRef.update({
         durationMinutes: routeData.durationMinutes,
         distanceKm: routeData.distanceKm,
       }).catch(() => {});
+      etaState.set(key, { lastMs: nowMs, lastLat: lat, lastLng: lng });
+    } else {
+      etaState.set(key, { lastMs: nowMs, lastLat: lat, lastLng: lng });
     }
   });
 
-  activeListeners.set(key, () => locRef.off('value', handler));
+  activeListeners.set(key, () => {
+    locRef.off('value', handler);
+    etaState.delete(key);
+  });
 }
 
 function stopTripEtaListener(orderId) {
@@ -2837,6 +2945,36 @@ app.post(
           );
         } catch (e) {
           console.log("notifyRider error", e?.message || e);
+        }
+      };
+
+      // NEW: helper to record earnings once per order (guarded by earningsRecorded)
+      const recordEarningsOnce = async (earningsAmount) => {
+        try {
+          if (!earningsAmount || earningsAmount <= 0) return;
+          const driverRef = db.collection("drivers").doc(driverId);
+          await db.runTransaction(async (t) => {
+            const orderSnap = await t.get(orderRef);
+            const od = orderSnap.data() || {};
+            if (od.earningsRecorded) return;
+            const driverSnap = await t.get(driverRef);
+            const dd = driverSnap.exists ? (driverSnap.data() || {}) : {};
+            const stats = dd.stats || {};
+            const prevTrips = Number(stats.totalTrips) || 0;
+            const prevEarnings = Number(stats.totalEarnings) || 0;
+            t.update(orderRef, {
+              earningsRecorded: true,
+              driverEarnings: earningsAmount
+            });
+            t.set(driverRef, {
+              stats: {
+                totalTrips: prevTrips + 1,
+                totalEarnings: prevEarnings + earningsAmount
+              }
+            }, { merge: true });
+          });
+        } catch (e) {
+          console.log("recordEarningsOnce error", e?.message || e);
         }
       };
 
@@ -3174,6 +3312,54 @@ app.post(
 
         // Stop pickup listener if still running
         stopPickupEtaListener(orderId);
+
+        // RECOMPUTE trip route from driver's current location through stops → drop.
+        // Ensures the started leg includes any stops added after acceptance.
+        try {
+          const locSnap = await rtdb.ref(`driver_locations/${driverId}`).once("value");
+          const loc = locSnap.val();
+          let startLat = null;
+          let startLng = null;
+          if (loc && Array.isArray(loc.l) && loc.l.length === 2) {
+            const clat = Number(loc.l[0]);
+            const clng = Number(loc.l[1]);
+            if (Number.isFinite(clat) && Number.isFinite(clng)) {
+              startLat = clat;
+              startLng = clng;
+            }
+          }
+
+          const validStops = (orderData.stops || []).filter(
+            s => s && Number(s.lat) !== 0 && Number(s.lng) !== 0
+          );
+
+          if (startLat !== null && startLng !== null) {
+            const startedRoute = await getRouteDataWithFallback(
+              startLat,
+              startLng,
+              dropLat,
+              dropLng,
+              validStops
+            );
+            if (startedRoute && startedRoute.encodedPolyline) {
+              await orderRef.update({
+                polyline: startedRoute.encodedPolyline,
+                encodedPolyline: startedRoute.encodedPolyline,
+                distanceKm: startedRoute.distanceKm,
+                durationMinutes: startedRoute.durationMinutes,
+              });
+              await rtdb.ref(`driver_trip_requests/${driverId}/${orderId}`).update({
+                encodedPolyline: startedRoute.encodedPolyline,
+                stops: validStops,
+                tripDistanceKm: startedRoute.distanceKm,
+                tripEtaMinutes: startedRoute.durationMinutes,
+              }).catch(() => {});
+            }
+          }
+        } catch (e) {
+          console.log("started route recompute error", e?.message || e);
+        }
+
         // Start trip ETA listener (driver → destination)
         startTripEtaListener(orderId, driverId, dropLat, dropLng, orderRef);
 
@@ -3274,6 +3460,11 @@ app.post(
         status === "delivered"
       ) {
 
+        const driverEarnings =
+          workflowType === "direct_trip"
+            ? Number(orderData.total ?? orderData.fare ?? 0)
+            : Number(orderData.fee ?? orderData.driverEarnings ?? 0);
+
         await orderRef.update({
 
           status:
@@ -3283,7 +3474,12 @@ app.post(
             "delivered",
 
           updatedAt:
-            now()
+            now(),
+
+          completedAt:
+            orderData.completedAt || now(),
+
+          driverEarnings
         });
 
         await updateDriverRequestStatus(
@@ -3299,6 +3495,9 @@ app.post(
         stopPickupEtaListener(orderId);
         stopTripEtaListener(orderId);
 
+        // Record earnings once (guarded by earningsRecorded)
+        await recordEarningsOnce(driverEarnings);
+
         return res.json({
 
           success: true
@@ -3312,6 +3511,11 @@ app.post(
         status === "completed"
       ) {
 
+        const driverEarnings =
+          workflowType === "direct_trip"
+            ? Number(orderData.total ?? orderData.fare ?? 0)
+            : Number(orderData.fee ?? orderData.driverEarnings ?? 0);
+
         await orderRef.update({
 
           status:
@@ -3321,10 +3525,12 @@ app.post(
             "completed",
 
           completedAt:
-            now(),
+            orderData.completedAt || now(),
 
           updatedAt:
-            now()
+            now(),
+
+          driverEarnings
         });
 
         await updateDriverRequestStatus(
@@ -3356,6 +3562,9 @@ app.post(
         // Stop both listeners
         stopPickupEtaListener(orderId);
         stopTripEtaListener(orderId);
+
+        // Record earnings once (guarded by earningsRecorded)
+        await recordEarningsOnce(driverEarnings);
 
         // NEW: notify rider
         notifyRider("Trip completed", "Thanks for riding with us. Please rate your experience.");
@@ -3644,6 +3853,7 @@ driversSnap.forEach((doc) => {
   if (!online[uid]?.isOnline) return;
   if (online[uid]?.isBusy) return;
   if (!locations[uid]?.l) return;
+  if (!locationIsFresh(locations[uid])) return;
   if (!d.vehicle) return;
 
   const services = Array.isArray(d.vehicle.services) ? d.vehicle.services : [];
@@ -3820,6 +4030,7 @@ app.post("/reroutePolyline", async (req, res) => {
         }
       : {
           polyline: routeData.encodedPolyline,
+          encodedPolyline: routeData.encodedPolyline,
           distanceKm: routeData.distanceKm,
           durationMinutes: routeData.durationMinutes,
         };
@@ -4021,6 +4232,7 @@ app.post("/updateOrderStops", async (req, res) => {
     const updateData = {
       stops: validStops,
       polyline: routeData.encodedPolyline,
+      encodedPolyline: routeData.encodedPolyline,
       distanceKm: routeData.distanceKm,
       durationMinutes: routeData.durationMinutes,
       fare: newFare,
