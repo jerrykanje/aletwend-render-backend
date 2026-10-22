@@ -1,4 +1,4 @@
- const express = require("express");
+const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 const axios = require("axios");
@@ -698,6 +698,8 @@ const CALL_ORDER_STATUSES = [
   "at_store",
   "picked_up"
 ];
+const RIDER_DRIVER_STORE_STATUSES = ["picked_up", "delivered"];
+const RIDER_DRIVER_DIRECT_STATUSES = ["accepted", "arriving", "arrived", "started", "in_progress", "on_trip", "picked_up", "delivered"];
 
 // ---- auth: returns verified uid, or sends 401 and returns null ----
 async function requireCallUser(req, res) {
@@ -810,8 +812,8 @@ async function loadCall(callId) {
 }
 
 // Store <-> customer calls (Shop & Market stores only): before a driver is being searched for.
-const STORE_CUSTOMER_STATUSES = ["pending", "accepted", "ready_for_pickup"];
-const STORE_CUSTOMER_DRIVER_STATUSES = ["waiting", "no_driver_found", ""];
+const STORE_CUSTOMER_STATUSES = ["accepted", "ready_for_pickup"];
+const STORE_CUSTOMER_BLOCKED_DRIVER_STATUSES = ["assigned", "at_store", "picked_up", "delivered", "completed"];
 // Store <-> driver calls: from driver_assigned until pickup.
 const STORE_DRIVER_STATUSES = ["driver_assigned", "at_store"];
 const STORE_DRIVER_DRIVER_STATUSES = ["assigned", "at_store"];
@@ -819,6 +821,7 @@ const STORE_ORDER_WORKFLOWS = ["store_delivery", "delivery"];
 const STORE_REMIND_EVERY_MS = 60 * 1000;
 const STORE_REMIND_MAX = 8;
 const STORE_ALERT_MAX_AGE_MS = 15 * 60 * 1000;
+const STORE_ACCEPT_GRACE_MS = Number(process.env.STORE_ACCEPT_GRACE_MS) || 5 * 60 * 1000;
 
 // ---- small helpers ----
 function toMillis(v) {
@@ -993,8 +996,56 @@ async function sweepStoreReminders() {
   }
 }
 
+/* ---------------- AUTO-REJECT unanswered store orders ---------------- */
+async function sweepUnansweredStoreOrders() {
+  try {
+    const snap = await db.collection("orders").where("status", "==", "pending").get();
+    const nowMs = Date.now();
+    for (const doc of snap.docs) {
+      const o = doc.data() || {};
+      if (!o.storeId) continue;
+      if (!STORE_ORDER_WORKFLOWS.includes(val(o.workflowType))) continue;
+      const createdMs = toMillis(o.createdAt);
+      if (!createdMs || nowMs - createdMs < STORE_ACCEPT_GRACE_MS) continue;
+
+      const ref = doc.ref;
+      let won = false;
+      try {
+        won = await db.runTransaction(async (t) => {
+          const fresh = await t.get(ref);
+          const d = fresh.data() || {};
+          if (d.status !== "pending") return false;
+          t.update(ref, {
+            status: "rejected",
+            rejectionReason: "still_closed",
+            rejectedAt: admin.firestore.FieldValue.serverTimestamp(),
+            autoRejected: true,
+            rejectedBy: "system"
+          });
+          return true;
+        });
+      } catch (e) {
+        console.log("sweepUnansweredStoreOrders transaction error", e?.message || e);
+        continue;
+      }
+      if (!won) continue;
+
+      await pushToStore(o.storeId, {
+        title: "Order expired",
+        body: `Order #${orderLabel(doc.id, o)} was declined automatically because it was not accepted in time.`,
+        data: { type: "order_expired", orderId: String(doc.id) }
+      });
+    }
+  } catch (e) {
+    console.log("sweepUnansweredStoreOrders error", e?.message || e);
+  }
+}
+
 function startStoreReminderSweep() {
-  setInterval(sweepStoreReminders, 30 * 1000);
+  setInterval(() => {
+    sweepStoreReminders().catch((e) => console.log("sweepStoreReminders uncaught", e?.message || e));
+    sweepUnansweredStoreOrders().catch((e) => console.log("sweepUnansweredStoreOrders uncaught", e?.message || e));
+  }, 30 * 1000);
 }
 
 /* ---------------- push to a call receiver (rider / driver / store) ---------------- */
@@ -1053,17 +1104,21 @@ app.post("/api/calls/start", async (req, res) => {
     const status = val(od.status);
     const driverStatus = val(od.driverStatus);
     const isStoreOrder = !!storeId && STORE_ORDER_WORKFLOWS.includes(val(od.workflowType));
+    const callableStore = !!storeId && (await isMarketStore(storeId));
+    const riderDriverAllowed = storeId ? RIDER_DRIVER_STORE_STATUSES.includes(status) : RIDER_DRIVER_DIRECT_STATUSES.includes(status);
     const inCustomerWindow =
       isStoreOrder &&
+      callableStore &&
       STORE_CUSTOMER_STATUSES.includes(status) &&
-      STORE_CUSTOMER_DRIVER_STATUSES.includes(driverStatus);
+      !STORE_CUSTOMER_BLOCKED_DRIVER_STATUSES.includes(driverStatus);
     const inDriverWindow =
       isStoreOrder &&
+      callableStore &&
       !!driverId &&
       STORE_DRIVER_STATUSES.includes(status) &&
       STORE_DRIVER_DRIVER_STATUSES.includes(driverStatus);
     const STORE_CALL_MESSAGE =
-      "Store calls are only available before a driver is searched for (Shop & Market stores) or while the driver is on the way to, or at, the store";
+      "Calls are only available for Small Shops and Soweto Market orders, once the store has accepted the order and before a driver is assigned, or between the store and the assigned driver until the driver is at the store";
 
     let callerRole;
     let receiverRole;
@@ -1072,9 +1127,6 @@ app.post("/api/calls/start", async (req, res) => {
     if (callerIsStore) {
       if (inCustomerWindow) {
         if (!riderId) return res.status(409).json({ success: false, error: "No customer on this order" });
-        if (!(await isMarketStore(storeId))) {
-          return res.status(409).json({ success: false, error: "Customer calls are only available for Shop & Market stores" });
-        }
         callerRole = "store"; receiverRole = "rider"; receiverId = riderId;
       } else if (inDriverWindow) {
         callerRole = "store"; receiverRole = "driver"; receiverId = driverId;
@@ -1082,12 +1134,13 @@ app.post("/api/calls/start", async (req, res) => {
         return res.status(409).json({ success: false, error: STORE_CALL_MESSAGE });
       }
     } else if (callerIsRider) {
-      if (inCustomerWindow && (await isMarketStore(storeId))) {
+      if (inCustomerWindow) {
         callerRole = "rider"; receiverRole = "store"; receiverId = storeId;
       } else {
         if (!driverId) return res.status(409).json({ success: false, error: "No driver assigned to this order yet" });
-        if (!CALL_ORDER_STATUSES.includes(status)) {
-          return res.status(409).json({ success: false, error: "Calls are only available during an active trip" });
+        if (!riderDriverAllowed) {
+          const msg = storeId ? "You can call your driver once your order has been picked up" : "Calls are only available during an active trip";
+          return res.status(409).json({ success: false, error: msg });
         }
         callerRole = "rider"; receiverRole = "driver"; receiverId = driverId;
       }
@@ -1098,8 +1151,9 @@ app.post("/api/calls/start", async (req, res) => {
         callerRole = "driver"; receiverRole = "store"; receiverId = storeId;
       } else {
         if (!riderId) return res.status(409).json({ success: false, error: "No customer on this order" });
-        if (!CALL_ORDER_STATUSES.includes(status)) {
-          return res.status(409).json({ success: false, error: "Calls are only available during an active trip" });
+        if (!riderDriverAllowed) {
+          const msg = storeId ? "You can call your driver once your order has been picked up" : "Calls are only available during an active trip";
+          return res.status(409).json({ success: false, error: msg });
         }
         callerRole = "driver"; receiverRole = "rider"; receiverId = riderId;
       }
@@ -2443,6 +2497,7 @@ async function sendRequestToDriver(
       vehicleCategory: val(orderData.vehicleCategory),
       dispatchService: val(orderData.dispatchService),
       fare: orderData.fare || null,
+      total: orderData.total ?? null, fee: orderData.fee ?? null,
 
       data: orderData
     };
@@ -3838,6 +3893,26 @@ app.post("/updateOrderStops", async (req, res) => {
     const orderData = orderDoc.data() || {};
     const workflowType = val(orderData.workflowType);
 
+    // Guard: direct_trip only, and only before the trip starts (accepted or arrived)
+    if (workflowType !== "direct_trip") {
+      return res.status(409).json({
+        success: false,
+        error: "Stops can only be added before the trip starts"
+      });
+    }
+    if (orderData.status !== "accepted" && orderData.status !== "arrived") {
+      return res.status(409).json({
+        success: false,
+        error: "Stops can only be added before the trip starts"
+      });
+    }
+    if (!orderData.driverId) {
+      return res.status(409).json({
+        success: false,
+        error: "Stops can only be added before the trip starts"
+      });
+    }
+
     // Filter out empty/invalid stops
     const validStops = newStops.filter(
       s => s && s.lat && s.lng && Number(s.lat) !== 0 && Number(s.lng) !== 0
@@ -3923,6 +3998,9 @@ app.post("/updateOrderStops", async (req, res) => {
     // Calculate new fare based on updated distance
     const newFare = calculateFare(baseFare, routeData.distanceKm);
 
+    // For direct_trip, fee equals the full fare
+    const newFee = newFare;
+
     // DRY RUN: return computed result without writing to Firestore or RTDB
     if (dryRun === true) {
       return res.json({
@@ -3932,6 +4010,7 @@ app.post("/updateOrderStops", async (req, res) => {
           durationMinutes: routeData.durationMinutes,
           fare: newFare,
           total: newFare,
+          fee: newFee,
           polyline: routeData.encodedPolyline,
           pricingCategory: pricingKey
         }
@@ -3946,11 +4025,15 @@ app.post("/updateOrderStops", async (req, res) => {
       durationMinutes: routeData.durationMinutes,
       fare: newFare,
       total: newFare,
+      fee: newFee,
       pricingCategory: pricingKey,
       updatedAt: now()
     };
 
     await orderRef.update(updateData);
+
+    // Use orderData.driverId for the RTDB path (not body.driverId)
+    const rtdbDriverId = orderData.driverId;
 
     // Also update the driver_trip_requests in RTDB if active
     const rtdbPayload = {
@@ -3958,11 +4041,13 @@ app.post("/updateOrderStops", async (req, res) => {
       encodedPolyline: routeData.encodedPolyline,
       tripDistanceKm: routeData.distanceKm,
       tripEtaMinutes: routeData.durationMinutes,
-      fare: newFare
+      fare: newFare, total: newFare, fee: newFee,
+      "data/stops": validStops,
+      "data/fare": newFare, "data/total": newFare, "data/fee": newFee
     };
 
     await rtdb
-      .ref(`driver_trip_requests/${driverId}/${orderId}`)
+      .ref(`driver_trip_requests/${rtdbDriverId}/${orderId}`)
       .update(rtdbPayload)
       .catch(() => {}); // Non-critical if request expired
 
