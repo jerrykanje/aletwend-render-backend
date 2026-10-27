@@ -1041,11 +1041,96 @@ async function sweepUnansweredStoreOrders() {
   }
 }
 
+/* ---------------- EXPIRY SWEEP for unanswered driver requests ---------------- */
+async function sweepExpiredDriverRequests() {
+  try {
+    const snap = await rtdb.ref("driver_trip_requests").once("value");
+    const all = snap.val() || {};
+    const nowMs = Date.now();
+    for (const driverUid of Object.keys(all)) {
+      const byOrder = all[driverUid] || {};
+      for (const orderId of Object.keys(byOrder)) {
+        const node = byOrder[orderId] || {};
+        if (node.status !== "incoming_request") continue;
+        const exp = Number(node.expiresAt) || 0;
+        if (!exp || (exp + 5000) >= nowMs) continue;
+
+        await rtdb.ref(`driver_trip_requests/${driverUid}/${orderId}`).update({ status: "expired" }).catch(() => {});
+        await rtdb.ref(`driver_trip_requests/${driverUid}/${orderId}`).remove().catch(() => {});
+        await rtdb.ref(`drivers_online/${driverUid}`).update({ currentRequest: null }).catch(() => {});
+        await recordDriverOutcome(driverUid, "expired");
+        await redispatchOrder(orderId, driverUid);
+      }
+    }
+  } catch (e) {
+    console.log("sweepExpiredDriverRequests error", e?.message || e);
+  }
+}
+
 function startStoreReminderSweep() {
   setInterval(() => {
     sweepStoreReminders().catch((e) => console.log("sweepStoreReminders uncaught", e?.message || e));
     sweepUnansweredStoreOrders().catch((e) => console.log("sweepUnansweredStoreOrders uncaught", e?.message || e));
+    sweepExpiredDriverRequests().catch((e) => console.log("sweepExpiredDriverRequests uncaught", e?.message || e));
   }, 30 * 1000);
+}
+
+/* ---------------- DRIVER ACTIVITY OUTCOME HELPER ---------------- */
+async function recordDriverOutcome(driverId, outcome) {
+  try {
+    if (!driverId || !outcome) return;
+    if (!["accepted", "declined", "expired"].includes(outcome)) return;
+    const ref = db.collection("drivers").doc(driverId);
+    await db.runTransaction(async (t) => {
+      const snap = await t.get(ref);
+      const d = snap.exists ? (snap.data() || {}) : {};
+      const existing = Array.isArray(d.activityOutcomes) ? d.activityOutcomes : [];
+      const next = existing.concat([outcome]).slice(-20);
+      const acceptedCount = next.filter((x) => x === "accepted").length;
+      const activityScore = next.length >= 5
+        ? Math.round(100 * (acceptedCount / next.length))
+        : null;
+      t.set(ref, {
+        activityOutcomes: next,
+        activityScore,
+        activityUpdatedAt: Date.now()
+      }, { merge: true });
+    });
+  } catch (e) {
+    console.log("recordDriverOutcome error", e?.message || e);
+  }
+}
+
+/* ---------------- REDISPATCH HELPER ---------------- */
+async function redispatchOrder(orderId, driverId) {
+  try {
+    if (!orderId || !driverId) return;
+    const orderRef = db.collection("orders").doc(orderId);
+    const orderDoc = await orderRef.get();
+    if (!orderDoc.exists) return;
+    const orderData = orderDoc.data() || {};
+
+    // Only continue if this driver still owns the pending offer
+    if (orderData.driverId !== driverId) return;
+    if (orderData.driverStatus !== "searching") return;
+
+    const wf = val(orderData.workflowType);
+    const st = val(orderData.status);
+    const unanswered =
+      (wf === "direct_trip" && st === "pending") ||
+      ((wf === "store_delivery" || wf === "delivery") && st === "ready_for_pickup");
+    if (!unanswered) return;
+
+    const attempts = (Number(orderData.dispatchAttempts) || 0) + 1;
+    await orderRef.update({
+      driverId: null,
+      excludedDriverIds: admin.firestore.FieldValue.arrayUnion(driverId),
+      dispatchAttempts: attempts,
+      driverStatus: attempts >= 5 ? "no_driver_found" : "waiting"
+    });
+  } catch (e) {
+    console.log("redispatchOrder error", e?.message || e);
+  }
 }
 
 /* ---------------- push to a call receiver (rider / driver / store) ---------------- */
@@ -2322,6 +2407,8 @@ async function findMatchingDriver(
 
         if (!uid) return;
 
+        if (Array.isArray(orderData.excludedDriverIds) && orderData.excludedDriverIds.includes(uid)) return;
+
         if (
           !online[uid]
             ?.isOnline
@@ -3000,6 +3087,14 @@ app.post(
               null
           });
 
+        // Record outcome and attempt a re-dispatch (never fail the response because of them)
+        try {
+          await recordDriverOutcome(driverId, "declined");
+          await redispatchOrder(orderId, driverId);
+        } catch (e) {
+          console.log("declined follow-up error", e?.message || e);
+        }
+
         return res.json({
 
           success: true
@@ -3012,6 +3107,21 @@ app.post(
       if (
         status === "accepted"
       ) {
+
+        // Only accept a request that is really addressed to this driver
+        const acceptOk =
+          orderData.driverId === driverId &&
+          orderData.driverStatus === "searching" &&
+          (
+            workflowType === "direct_trip"
+              ? orderData.status === "pending"
+              : orderData.status === "ready_for_pickup"
+          );
+
+        if (!acceptOk) {
+          await removeDriverRequest(driverId, orderId);
+          return res.status(409).json({ error: "This request is no longer available" });
+        }
 
         /* ---------------------------------------------------
            📦 FETCH DRIVER SNAPSHOT FROM DRIVERS COLLECTION
@@ -3217,6 +3327,13 @@ app.post(
             body: `${(driverSnapshot && driverSnapshot.firstName) || "A driver"} is coming to pick up order #${orderLabel(orderId, orderData)}.`,
             data: { type: "driver_assigned", orderId: String(orderId) }
           });
+        }
+
+        // Record outcome — fire and forget, never fail the response
+        try {
+          await recordDriverOutcome(driverId, "accepted");
+        } catch (e) {
+          console.log("accepted recordDriverOutcome error", e?.message || e);
         }
 
         return res.json({
@@ -3511,6 +3628,11 @@ app.post(
         status === "completed"
       ) {
 
+        // Idempotent: a double tap must not reset an earned order back to pending
+        if (orderData.status === "completed") {
+          return res.json({ success: true, alreadyApplied: true });
+        }
+
         const driverEarnings =
           workflowType === "direct_trip"
             ? Number(orderData.total ?? orderData.fare ?? 0)
@@ -3530,7 +3652,16 @@ app.post(
           updatedAt:
             now(),
 
-          driverEarnings
+          driverEarnings,
+
+          driverEarningsStatus: "pending",
+
+          driverEarningsAmount:
+            STORE_ORDER_WORKFLOWS.includes(val(orderData.workflowType))
+              ? (Number(orderData.fee) || 0)
+              : (Number(orderData.total ?? orderData.fare) || 0),
+
+          driverEarningsCurrency: orderData.currency || "ZMW"
         });
 
         await updateDriverRequestStatus(
@@ -3658,6 +3789,60 @@ app.post(
     }
   }
 );
+
+/* =======================================================
+   🔥 NEW ROUTE: POST /ackDriverEarnings
+   Body: { orderId }
+   Requires Firebase ID token.
+======================================================= */
+app.post("/ackDriverEarnings", async (req, res) => {
+  try {
+    const uid = await requireCallUser(req, res);
+    if (!uid) return;
+
+    const orderId = val(req.body && req.body.orderId);
+    if (!orderId) {
+      return res.status(400).json({ success: false, error: "Missing orderId" });
+    }
+
+    const orderRef = db.collection("orders").doc(orderId);
+    const orderDoc = await orderRef.get();
+
+    if (!orderDoc.exists) {
+      return res.status(404).json({ success: false, error: "Order not found" });
+    }
+
+    const orderData = orderDoc.data() || {};
+
+    if (orderData.driverId !== uid) {
+      return res.status(403).json({ success: false, error: "Not your order" });
+    }
+
+    if (orderData.status !== "completed") {
+      return res.status(409).json({ success: false, error: "Trip is not completed" });
+    }
+
+    if (orderData.driverEarningsStatus === "earned") {
+      return res.json({ success: true, alreadyApplied: true });
+    }
+
+    if (orderData.driverEarningsStatus === undefined || orderData.driverEarningsStatus === null) {
+      // Old order — do not write anything
+      return res.json({ success: true, skipped: true });
+    }
+
+    await orderRef.update({
+      driverEarningsStatus: "earned",
+      driverEarningsAckAt: now()
+    });
+
+    return res.json({ success: true });
+
+  } catch (error) {
+    console.error("Error in /ackDriverEarnings:", error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
 
 /* =======================================================
    🔥 FIRESTORE ORDERS LISTENER
