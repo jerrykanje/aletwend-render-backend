@@ -3,6 +3,7 @@ const cors = require("cors");
 const admin = require("firebase-admin");
 const axios = require("axios");
 const polyline = require("polyline");
+const crypto = require("crypto");
 const { RtcTokenBuilder, RtcRole } = require("agora-token");
 
 const app = express();
@@ -744,6 +745,15 @@ function buildCallCredentials(channelName, uid) {
   };
 }
 
+// ---- HMAC for quick-decline action tokens ----
+function buildCallActionToken(callId, receiverId, expiresAt) {
+  const secret = process.env.CALL_ACTION_SECRET || "";
+  return crypto
+    .createHmac("sha256", secret)
+    .update(`${callId}.${receiverId}.${expiresAt}`)
+    .digest("hex");
+}
+
 // ---- per-user copy of a call record ----
 function callCopyFor(call, uid) {
   return {
@@ -800,6 +810,11 @@ async function finishCall(call, status, endReason) {
     endedAt: admin.database.ServerValue.TIMESTAMP,
     durationSeconds
   });
+
+  // Notify both participants so their UIs clear.
+  await pushData("users", call.callerId, { type: "call_ended", callId: String(call.callId), status: String(status) }, { ttlMs: 30000 });
+  await pushData("users", call.receiverId, { type: "call_ended", callId: String(call.callId), status: String(status) }, { ttlMs: 30000 });
+
   scheduleCallCleanup(done);
   return done;
 }
@@ -852,6 +867,43 @@ async function getPushTokens(collection, id) {
   if (Array.isArray(d.fcmTokens)) list.push(...d.fcmTokens);
   [d.fcmToken, d.pushToken, d.profile && d.profile.fcmToken].forEach((t) => t && list.push(t));
   return [...new Set(list.filter((t) => typeof t === "string" && t.length > 20))];
+}
+
+// ---- data-only multicast push (no notification block) for native apps; prunes dead tokens ----
+async function pushData(collection, id, data, { ttlMs }) {
+  try {
+    const tokens = await getPushTokens(collection, id);
+    if (!tokens.length) return 0;
+    const stringData = Object.fromEntries(
+      Object.entries(data || {}).map(([k, v]) => [k, String(v)])
+    );
+    const response = await admin.messaging().sendEachForMulticast({
+      tokens,
+      data: stringData,
+      android: { priority: "high", ttl: ttlMs },
+      webpush: { headers: { Urgency: "high", TTL: String(Math.floor(ttlMs / 1000)) } },
+      apns: { headers: { "apns-priority": "10" } }
+    });
+
+    // Prune any tokens FCM reports as invalid
+    const dead = [];
+    (response.responses || []).forEach((r, i) => {
+      if (r.success) return;
+      const code = (r.error && r.error.code) || "";
+      if (code.includes("registration-token-not-registered") || code.includes("invalid-registration-token")) {
+        dead.push(tokens[i]);
+      }
+    });
+    if (dead.length) {
+      await db.collection(collection).doc(id).update({
+        fcmTokens: admin.firestore.FieldValue.arrayRemove(...dead)
+      }).catch(() => {});
+    }
+    return response.successCount || 0;
+  } catch (e) {
+    console.log("pushData error", e?.message || e);
+    return 0;
+  }
 }
 
 // ---- loud, high-priority push to a store owner (all devices); prunes dead tokens ----
@@ -920,11 +972,14 @@ async function notifyStoreNewOrder(orderId, data) {
     });
     if (!won) return;
 
-    await pushToStore(data.storeId, {
+    const body = `Order #${orderLabel(orderId, data)} from ${data.userName || "a customer"} is waiting. Tap to accept.`;
+    await pushData("stores", data.storeId, {
+      type: "new_order",
+      orderId: String(orderId),
       title: "New order! 🛎️",
-      body: `Order #${orderLabel(orderId, data)} from ${data.userName || "a customer"} is waiting. Tap to accept.`,
-      data: { type: "new_order", orderId: String(orderId) }
-    });
+      body,
+      expiresAt: String(Date.now() + 30000)
+    }, { ttlMs: 60000 });
   } catch (e) {
     console.log("notifyStoreNewOrder error", e?.message || e);
   }
@@ -954,6 +1009,12 @@ async function notifyStoreOrderCancelled(orderId, data) {
       body: `Order #${orderLabel(orderId, data)} was cancelled by the customer${reason ? ": " + reason : "."}`,
       data: { type: "order_cancelled", orderId: String(orderId) }
     });
+
+    // Data-only signal for native apps to hide the accept panel
+    await pushData("stores", data.storeId, {
+      type: "order_ended",
+      orderId: String(orderId)
+    }, { ttlMs: 30000 });
   } catch (e) {
     console.log("notifyStoreOrderCancelled error", e?.message || e);
   }
@@ -1035,6 +1096,12 @@ async function sweepUnansweredStoreOrders() {
         body: `Order #${orderLabel(doc.id, o)} was declined automatically because it was not accepted in time.`,
         data: { type: "order_expired", orderId: String(doc.id) }
       });
+
+      // Data-only signal for native apps to hide the accept panel
+      await pushData("stores", o.storeId, {
+        type: "order_ended",
+        orderId: String(doc.id)
+      }, { ttlMs: 30000 });
     }
   } catch (e) {
     console.log("sweepUnansweredStoreOrders error", e?.message || e);
@@ -1059,6 +1126,7 @@ async function sweepExpiredDriverRequests() {
         await rtdb.ref(`driver_trip_requests/${driverUid}/${orderId}`).remove().catch(() => {});
         await rtdb.ref(`drivers_online/${driverUid}`).update({ currentRequest: null }).catch(() => {});
         await recordDriverOutcome(driverUid, "expired");
+        await pushData("drivers", driverUid, { type: "request_ended", orderId: String(orderId) }, { ttlMs: 30000 });
         await redispatchOrder(orderId, driverUid);
       }
     }
@@ -1134,25 +1202,21 @@ async function redispatchOrder(orderId, driverId) {
 }
 
 /* ---------------- push to a call receiver (rider / driver / store) ---------------- */
-async function pushIncomingCall(receiverId, receiverRole, callerName, callId, orderId) {
+async function pushIncomingCall(receiverId, receiverRole, callerName, callId, orderId, expiresAt) {
   try {
-    if (receiverRole === "store") {
-      await pushToStore(receiverId, {
-        title: "Incoming call 📞",
-        body: `${callerName} is calling you`,
-        data: { type: "incoming_call", callId: String(callId), orderId: String(orderId) },
-        ttlMs: CALL_RING_MS
-      });
-      return;
-    }
-    const tokens = await getPushTokens(PUSH_COLLECTION[receiverRole] || "users", receiverId);
-    for (const token of tokens) {
-      await sendPushNotification(token, "Incoming call", `${callerName} is calling you`, {
-        type: "incoming_call",
-        callId: String(callId),
-        orderId: String(orderId)
-      });
-    }
+    const actionToken = buildCallActionToken(callId, receiverId, expiresAt);
+    const payload = {
+      type: "incoming_call",
+      callId: String(callId),
+      orderId: String(orderId),
+      callerName: String(callerName),
+      title: "Incoming call",
+      body: `${callerName} is calling you`,
+      expiresAt: String(expiresAt),
+      actionToken
+    };
+    const collection = PUSH_COLLECTION[receiverRole] || "users";
+    await pushData(collection, receiverId, payload, { ttlMs: CALL_RING_MS });
   } catch (e) {
     console.log("pushIncomingCall error", e?.message || e);
   }
@@ -1300,7 +1364,7 @@ app.post("/api/calls/start", async (req, res) => {
       [`user_calls/${receiverId}`]: callCopyFor(call, receiverId)
     });
 
-    pushIncomingCall(receiverId, receiverRole, callerName, callId, orderId);
+    pushIncomingCall(receiverId, receiverRole, callerName, callId, orderId, call.expiresAt);
 
     return res.json({ success: true, callId, expiresAt: call.expiresAt, ...creds });
   } catch (error) {
@@ -1330,6 +1394,13 @@ app.post("/api/calls/accept", async (req, res) => {
       startedAt: admin.database.ServerValue.TIMESTAMP
     });
 
+    // Tell the receiver's other devices to stop ringing.
+    await pushData("users", call.receiverId, {
+      type: "call_ended",
+      callId: String(call.callId),
+      status: "active"
+    }, { ttlMs: 30000 });
+
     return res.json({ success: true, callId: call.callId, ...creds });
   } catch (error) {
     console.error("Error in /api/calls/accept:", error);
@@ -1354,6 +1425,48 @@ app.post("/api/calls/decline", async (req, res) => {
     return res.json({ success: true });
   } catch (error) {
     console.error("Error in /api/calls/decline:", error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/* ---------------------- DECLINE-QUICK (no Firebase auth) ---------------------- */
+app.post("/api/calls/decline-quick", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const callId = val(body.callId);
+    const actionToken = val(body.actionToken);
+    if (!callId || !actionToken) {
+      return res.status(403).json({ success: false, error: "Invalid action token" });
+    }
+
+    const call = await loadCall(callId);
+    if (!call) {
+      // Never 404: treat unknown call as already finished.
+      return res.json({ success: true });
+    }
+
+    const expected = buildCallActionToken(call.callId, call.receiverId, call.expiresAt);
+    let ok = false;
+    try {
+      const a = Buffer.from(expected);
+      const b = Buffer.from(actionToken);
+      if (a.length === b.length) ok = crypto.timingSafeEqual(a, b);
+    } catch (e) {
+      ok = false;
+    }
+    if (!ok) {
+      return res.status(403).json({ success: false, error: "Invalid action token" });
+    }
+
+    if (call.status !== "ringing") {
+      // Already finished — treat as success
+      return res.json({ success: true });
+    }
+
+    await finishCall(call, "declined", "declined");
+    return res.json({ success: true });
+  } catch (error) {
+    console.error("Error in /api/calls/decline-quick:", error);
     return res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -2725,35 +2838,15 @@ async function dispatchOrder(orderId, orderData) {
       routingData
     );
 
-    // Step 6 (NEW): Push notification to matched driver — fire and forget
-    (async () => {
-      try {
-        const driverDoc = await db.collection("drivers").doc(matchedDriver.uid).get();
-        if (driverDoc.exists) {
-          const dData = driverDoc.data() || {};
-          const driverToken =
-            dData.fcmToken ||
-            dData.pushToken ||
-            dData?.profile?.fcmToken ||
-            null;
-
-          if (driverToken) {
-            await sendPushNotification(
-              driverToken,
-              "New ride request nearby",
-              "Tap to view the trip details and accept.",
-              {
-                type: "new_trip_request",
-                orderId: String(orderId),
-                workflowType: String(workflowType || "")
-              }
-            );
-          }
-        }
-      } catch (e) {
-        console.log("dispatchOrder push error", e?.message || e);
-      }
-    })();
+    // Step 6: Data-only push to the matched driver's native app
+    await pushData("drivers", matchedDriver.uid, {
+      type: "new_trip_request",
+      orderId: String(orderId),
+      workflowType: String(workflowType || ""),
+      title: "New ride request",
+      body: "Tap to view the trip details and accept.",
+      expiresAt: String(Date.now() + 30000)
+    }, { ttlMs: 30000 });
 
   } catch (error) {
     console.log("dispatchOrder error", error);
@@ -3087,6 +3180,12 @@ app.post(
               null
           });
 
+        // Data-only signal for native driver apps to hide the accept panel
+        await pushData("drivers", driverId, {
+          type: "request_ended",
+          orderId: String(orderId)
+        }, { ttlMs: 30000 });
+
         // Record outcome and attempt a re-dispatch (never fail the response because of them)
         try {
           await recordDriverOutcome(driverId, "declined");
@@ -3313,6 +3412,20 @@ app.post(
               )
               .remove();
           }
+        }
+
+        // Data-only signal for this driver's native app
+        await pushData("drivers", driverId, {
+          type: "request_ended",
+          orderId: String(orderId)
+        }, { ttlMs: 30000 });
+
+        // Data-only signal for the store's native app
+        if (orderData.storeId) {
+          await pushData("stores", orderData.storeId, {
+            type: "order_ended",
+            orderId: String(orderId)
+          }, { ttlMs: 30000 });
         }
 
         // Start pickup ETA listener (for both direct and store delivery)
@@ -3753,6 +3866,20 @@ app.post(
 
             currentRequest: null
           });
+
+        // Data-only signal for driver's native app
+        await pushData("drivers", driverId, {
+          type: "request_ended",
+          orderId: String(orderId)
+        }, { ttlMs: 30000 });
+
+        // Data-only signal for the store's native app
+        if (orderData.storeId) {
+          await pushData("stores", orderData.storeId, {
+            type: "order_ended",
+            orderId: String(orderId)
+          }, { ttlMs: 30000 });
+        }
 
         // Stop both listeners
         stopPickupEtaListener(orderId);
