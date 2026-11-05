@@ -1,4 +1,4 @@
- const express = require("express");
+const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 const axios = require("axios");
@@ -746,8 +746,10 @@ function buildCallCredentials(channelName, uid) {
 }
 
 // ---- HMAC for quick-decline action tokens ----
+// FIX 2: if CALL_ACTION_SECRET is empty, return null (do not sign with an empty key).
 function buildCallActionToken(callId, receiverId, expiresAt) {
   const secret = process.env.CALL_ACTION_SECRET || "";
+  if (!secret) return null;
   return crypto
     .createHmac("sha256", secret)
     .update(`${callId}.${receiverId}.${expiresAt}`)
@@ -811,9 +813,11 @@ async function finishCall(call, status, endReason) {
     durationSeconds
   });
 
-  // Notify both participants so their UIs clear.
-  await pushData("users", call.callerId, { type: "call_ended", callId: String(call.callId), status: String(status) }, { ttlMs: 30000 });
-  await pushData("users", call.receiverId, { type: "call_ended", callId: String(call.callId), status: String(status) }, { ttlMs: 30000 });
+  // FIX 1: Notify each participant in their REAL collection (rider -> users, driver -> drivers, store -> stores).
+  const callerCollection = PUSH_COLLECTION[call.callerRole] || "users";
+  const receiverCollection = PUSH_COLLECTION[call.receiverRole] || "users";
+  await pushData(callerCollection, call.callerId, { type: "call_ended", callId: String(call.callId), status: String(status) }, { ttlMs: 30000 });
+  await pushData(receiverCollection, call.receiverId, { type: "call_ended", callId: String(call.callId), status: String(status) }, { ttlMs: 30000 });
 
   scheduleCallCleanup(done);
   return done;
@@ -1204,7 +1208,7 @@ async function redispatchOrder(orderId, driverId) {
 /* ---------------- push to a call receiver (rider / driver / store) ---------------- */
 async function pushIncomingCall(receiverId, receiverRole, callerName, callId, orderId, expiresAt) {
   try {
-    const actionToken = buildCallActionToken(callId, receiverId, expiresAt);
+    const actionToken = buildCallActionToken(callId, receiverId, expiresAt); // may be null when CALL_ACTION_SECRET is empty
     const payload = {
       type: "incoming_call",
       callId: String(callId),
@@ -1212,9 +1216,12 @@ async function pushIncomingCall(receiverId, receiverRole, callerName, callId, or
       callerName: String(callerName),
       title: "Incoming call",
       body: `${callerName} is calling you`,
-      expiresAt: String(expiresAt),
-      actionToken
+      expiresAt: String(expiresAt)
+      // FIX 2: only include actionToken if it was actually signed
     };
+    if (actionToken) {
+      payload.actionToken = actionToken;
+    }
     const collection = PUSH_COLLECTION[receiverRole] || "users";
     await pushData(collection, receiverId, payload, { ttlMs: CALL_RING_MS });
   } catch (e) {
@@ -1394,8 +1401,9 @@ app.post("/api/calls/accept", async (req, res) => {
       startedAt: admin.database.ServerValue.TIMESTAMP
     });
 
-    // Tell the receiver's other devices to stop ringing.
-    await pushData("users", call.receiverId, {
+    // FIX 1: Tell the receiver's other devices to stop ringing — in the receiver's real collection.
+    const receiverCollection = PUSH_COLLECTION[call.receiverRole] || "users";
+    await pushData(receiverCollection, call.receiverId, {
       type: "call_ended",
       callId: String(call.callId),
       status: "active"
@@ -1445,7 +1453,12 @@ app.post("/api/calls/decline-quick", async (req, res) => {
       return res.json({ success: true });
     }
 
+    // FIX 2: if the secret is not configured, no valid action token can exist → 403.
     const expected = buildCallActionToken(call.callId, call.receiverId, call.expiresAt);
+    if (!expected) {
+      return res.status(403).json({ success: false, error: "Invalid action token" });
+    }
+
     let ok = false;
     try {
       const a = Buffer.from(expected);
