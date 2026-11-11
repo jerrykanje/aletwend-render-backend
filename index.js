@@ -1113,7 +1113,6 @@ async function sweepUnansweredStoreOrders() {
 }
 
 /* ---------------- EXPIRY SWEEP for unanswered driver requests ---------------- */
-// ===== FIX 5: grace reduced from 5000ms to 2000ms =====
 async function sweepExpiredDriverRequests() {
   try {
     const snap = await rtdb.ref("driver_trip_requests").once("value");
@@ -1125,7 +1124,7 @@ async function sweepExpiredDriverRequests() {
         const node = byOrder[orderId] || {};
         if (node.status !== "incoming_request") continue;
         const exp = Number(node.expiresAt) || 0;
-        if (!exp || (exp + 2000) >= nowMs) continue;
+        if (!exp || (exp + 5000) >= nowMs) continue;
 
         await rtdb.ref(`driver_trip_requests/${driverUid}/${orderId}`).update({ status: "expired" }).catch(() => {});
         await rtdb.ref(`driver_trip_requests/${driverUid}/${orderId}`).remove().catch(() => {});
@@ -1140,48 +1139,12 @@ async function sweepExpiredDriverRequests() {
   }
 }
 
-// ===== FIX 5 + FIX 6: split sweeps; expiry every 5s, stale presence every 60s =====
 function startStoreReminderSweep() {
   setInterval(() => {
     sweepStoreReminders().catch((e) => console.log("sweepStoreReminders uncaught", e?.message || e));
     sweepUnansweredStoreOrders().catch((e) => console.log("sweepUnansweredStoreOrders uncaught", e?.message || e));
-  }, 30 * 1000);
-
-  // FIX 5: faster expiry on its own interval
-  setInterval(() => {
     sweepExpiredDriverRequests().catch((e) => console.log("sweepExpiredDriverRequests uncaught", e?.message || e));
-  }, 5000);
-
-  // FIX 6: stale presence sweep
-  setInterval(() => {
-    sweepStaleDriverPresence().catch((e) => console.log("sweepStaleDriverPresence uncaught", e?.message || e));
-  }, 60 * 1000);
-}
-
-/* ---------------- FIX 6: STALE PRESENCE SWEEP ---------------- */
-const PRESENCE_STALE_MS = 10 * 60 * 1000; // 10 minutes
-async function sweepStaleDriverPresence() {
-  try {
-    const [onlineSnap, locSnap] = await Promise.all([
-      rtdb.ref("drivers_online").once("value"),
-      rtdb.ref("driver_locations").once("value"),
-    ]);
-    const online = onlineSnap.val() || {};
-    const locations = locSnap.val() || {};
-    const nowMs = Date.now();
-    for (const uid of Object.keys(online)) {
-      const node = online[uid] || {};
-      if (!node.isOnline) continue;
-      if (node.isBusy) continue;
-      const loc = locations[uid];
-      const t = Number(loc && (loc.t || loc.updatedAt)) || 0;
-      if (!t || nowMs - t > PRESENCE_STALE_MS) {
-        await rtdb.ref(`drivers_online/${uid}`).update({ isOnline: false, updatedAt: nowMs }).catch(() => {});
-      }
-    }
-  } catch (e) {
-    console.log("sweepStaleDriverPresence error", e?.message || e);
-  }
+  }, 30 * 1000);
 }
 
 /* ---------------- DRIVER ACTIVITY OUTCOME HELPER ---------------- */
@@ -2483,8 +2446,7 @@ function calculateFare(
 
 const DRIVER_SEARCH_RADIUS_KM = 7;
 const DELIVERY_FAMILY = ["courier", "package", "delivery"];
-// ===== FIX 3: location freshness from env (default 90000ms) =====
-const LOCATION_MAX_AGE_MS = Number(process.env.LOCATION_MAX_AGE_MS) || 90000;
+const LOCATION_MAX_AGE_MS = 60 * 1000; // ignore drivers whose location is older than 60s
 const ETA_THROTTLE_MS = 15 * 1000;     // at most one ORS call every 15s per order
 const ETA_MIN_MOVE_M = 30;             // only recompute when driver moved > 30m
 const ETA_MAX_SPEED_MS = 45;           // reject jumps that imply > 45 m/s
@@ -2501,144 +2463,7 @@ const VEHICLE_CAPACITY_KG = { delivery_bicycle: 8, delivery_motorbike: 25, deliv
 function vehicleCapacityKg(vehicle) { const type = val(vehicle && vehicle.type).toLowerCase(); if (type === "bicycle") return 8; if (type === "motorbike") return 25; if (type === "car") return 200; if (type === "truck") return (Number(vehicle.tonnage) || 5) * 1000; return 200; }
 
 /* =======================================================
-   FIX 1 + FIX 2: SINGLE ELIGIBILITY FUNCTION + DIAGNOSTICS
-   Used by BOTH findMatchingDriver and /getRideOptions so
-   they behave identically. Also requires verificationStatus
-   === "approved" (FIX 1 addition).
-======================================================= */
-const _elIgReasonOrder = [
-  "not_online",
-  "busy",
-  "no_location",
-  "stale_location",
-  "no_vehicle",
-  "not_approved",
-  "service_mismatch",
-  "category_mismatch",
-  "capacity",
-  "out_of_radius",
-  "excluded",
-];
-
-/**
- * Single source of truth for whether a driver may be dispatched.
- * @param {string} uid - driver uid
- * @param {Object} driverDoc - drivers/{uid} data
- * @param {Object} online - drivers_online snapshot (whole object)
- * @param {Object} locations - driver_locations snapshot (whole object)
- * @param {Object} ctx - { dispatchService, pickupLat, pickupLng, totalKg, excludedDriverIds, requiredCategory }
- * @returns {{ok: boolean, reason: string|null, distanceKm: number|null, locAgeSec: number|null}}
- */
-function evaluateDriver(uid, driverDoc, online, locations, ctx) {
-  const d = driverDoc || {};
-  const ctxObj = ctx || {};
-  const onlineNode = (online || {})[uid] || {};
-  const loc = (locations || {})[uid];
-
-  const locT = Number(loc && (loc.t || loc.updatedAt)) || 0;
-  const locAgeSec = locT ? Math.round((Date.now() - locT) / 1000) : null;
-
-  const distanceKm = loc && Array.isArray(loc.l) && loc.l.length === 2
-    ? haversine(
-        Number(ctxObj.pickupLat),
-        Number(ctxObj.pickupLng),
-        Number(loc.l[0]),
-        Number(loc.l[1])
-      )
-    : null;
-
-  const reasons = [];
-  const out = (reason) => ({ ok: false, reason, distanceKm, locAgeSec });
-
-  if (Array.isArray(ctxObj.excludedDriverIds) && ctxObj.excludedDriverIds.includes(uid)) {
-    reasons.push("excluded");
-  }
-  if (!onlineNode.isOnline) {
-    reasons.push("not_online");
-  }
-  if (onlineNode.isBusy) {
-    reasons.push("busy");
-  }
-  if (!loc || !Array.isArray(loc.l) || loc.l.length !== 2) {
-    reasons.push("no_location");
-  } else if (!locationIsFresh(loc)) {
-    reasons.push("stale_location");
-  }
-  if (!d.vehicle) {
-    reasons.push("no_vehicle");
-  }
-  if (d.verificationStatus !== "approved") {
-    reasons.push("not_approved");
-  }
-
-  const dispatchService = val(ctxObj.dispatchService);
-  const requiredCategory = val(ctxObj.requiredCategory);
-
-  if (d.vehicle) {
-    const pricing = d.vehicle.pricingCategory || [];
-    const categories = d.vehicle.vehicleCategory || [];
-    const services = d.vehicle.services || [];
-
-    if (dispatchService) {
-      const serviceOk =
-        pricing.includes(dispatchService) ||
-        categories.includes(dispatchService);
-      if (!serviceOk) {
-        reasons.push("service_mismatch");
-      }
-    }
-
-    if (requiredCategory) {
-      const catOk =
-        pricing.includes(requiredCategory) ||
-        categories.includes(requiredCategory);
-      if (!catOk) {
-        reasons.push("category_mismatch");
-      }
-    }
-
-    const totalKg = Number(ctxObj.totalKg) || 0;
-    if (totalKg > 0 && vehicleCapacityKg(d.vehicle) < totalKg) {
-      reasons.push("capacity");
-    }
-  }
-
-  if (distanceKm != null && distanceKm > DRIVER_SEARCH_RADIUS_KM) {
-    reasons.push("out_of_radius");
-  }
-
-  if (reasons.length === 0) {
-    return { ok: true, reason: null, distanceKm, locAgeSec };
-  }
-
-  // Deterministic priority — pick the first in the ordered list.
-  const reason = _elIgReasonOrder.find((r) => reasons.includes(r)) || reasons[0];
-  return { ok: false, reason, distanceKm, locAgeSec };
-}
-
-/* FIX 2: diagnostics helper */
-function logZeroDriverDiagnostics(source, reasonCounts, rejected) {
-  // 3 closest rejected drivers
-  const closest = [...rejected]
-    .sort((a, b) => (a.distanceKm ?? Infinity) - (b.distanceKm ?? Infinity))
-    .slice(0, 3)
-    .map((r) => ({
-      uid: String(r.uid || "").slice(-4),
-      reason: r.reason,
-      distanceKm: r.distanceKm == null ? null : Math.round(r.distanceKm * 100) / 100,
-      locAgeSec: r.locAgeSec,
-    }));
-  console.log(JSON.stringify({
-    source,
-    zeroDrivers: true,
-    reasonCounts,
-    closestRejected: closest,
-  }));
-}
-
-/* =======================================================
    🔥 FIND MATCHING DRIVER (FIX 3: PARALLEL ORS)
-   FIX 1: now delegates to evaluateDriver.
 ======================================================= */
 async function findMatchingDriver(
   orderData
@@ -2696,11 +2521,10 @@ async function findMatchingDriver(
         .get();
 
     let matches = [];
-    const reasonCounts = {};
-    const rejected = [];
 
     driversSnap.forEach(
       (doc) => {
+
         const d =
           doc.data() || {};
 
@@ -2709,31 +2533,99 @@ async function findMatchingDriver(
 
         if (!uid) return;
 
-        const evalRes = evaluateDriver(uid, d, online, locations, {
-          dispatchService,
-          pickupLat,
-          pickupLng,
-          totalKg: Number(orderData.totalKg) || 0,
-          excludedDriverIds: orderData.excludedDriverIds,
+        if (Array.isArray(orderData.excludedDriverIds) && orderData.excludedDriverIds.includes(uid)) return;
+
+        if (
+          !online[uid]
+            ?.isOnline
+        ) return;
+
+        if (
+          online[uid]
+            ?.isBusy
+        ) return;
+
+        if (
+          !locations[uid]
+            ?.l
+        ) return;
+
+        if (!locationIsFresh(locations[uid])) return;
+
+        if (
+          !d.vehicle
+        ) return;
+
+        if (
+          d.verificationStatus !==
+          "approved"
+        ) return;
+
+        const pricing =
+          d.vehicle
+            ?.pricingCategory || [];
+
+        const categories =
+          d.vehicle
+            ?.vehicleCategory || [];
+
+        const matched =
+
+          pricing.includes(
+            dispatchService
+          ) ||
+
+          categories.includes(
+            dispatchService
+          );
+
+        if (
+          !matched
+        ) return;
+
+        const totalKg = Number(orderData.totalKg) || 0;
+        if (totalKg > 0 && vehicleCapacityKg(d.vehicle) < totalKg) return;
+
+        const lat =
+          Number(
+            locations[
+              uid
+            ].l[0]
+          );
+
+        const lng =
+          Number(
+            locations[
+              uid
+            ].l[1]
+          );
+
+        const distance =
+          haversine(
+
+            pickupLat,
+
+            pickupLng,
+
+            lat,
+
+            lng
+          );
+
+        if (
+          distance > DRIVER_SEARCH_RADIUS_KM
+        ) return;
+
+        matches.push({
+
+          uid,
+
+          distance,
+          driverLat: lat,
+          driverLng: lng
         });
-
-        if (!evalRes.ok) {
-          reasonCounts[evalRes.reason] = (reasonCounts[evalRes.reason] || 0) + 1;
-          rejected.push({ uid, reason: evalRes.reason, distanceKm: evalRes.distanceKm, locAgeSec: evalRes.locAgeSec });
-          return;
-        }
-
-        const lat = Number(locations[uid].l[0]);
-        const lng = Number(locations[uid].l[1]);
-
-        matches.push({ uid, distance: evalRes.distanceKm, driverLat: lat, driverLng: lng });
       }
     );
-
-    if (matches.length === 0) {
-      logZeroDriverDiagnostics("findMatchingDriver", reasonCounts, rejected);
-      return null;
-    }
 
     // Sort by haversine distance and take top 5 for ORS refinement
     matches.sort(
@@ -2898,12 +2790,15 @@ async function sendRequestToDriver(
 /* =======================================================
    🔥 DISPATCH ORDER (FIX 2: stops & Firestore field names)
    + NEW: push notification to matched driver
-   FIX 4: removed the initial driverStatus->searching update
-   (now claimed atomically in the Firestore listener).
 ======================================================= */
 async function dispatchOrder(orderId, orderData) {
   try {
     const workflowType = val(orderData.workflowType);
+
+    await db.collection("orders").doc(orderId).update({
+      driverStatus: "searching",
+      dispatchStartedAt: now()
+    });
 
     // Extract stops with coordinates (filter out zero-coord stops)
     const stops = (orderData.stops || []).filter(
@@ -3099,13 +2994,6 @@ function stopTripEtaListener(orderId) {
 }
 
 /* =======================================================
-   FIX 7: LUSAKA DAILY EARNINGS DATE KEY
-======================================================= */
-function lusakaDateKey() {
-  return new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Lusaka" }).format(new Date());
-}
-
-/* =======================================================
    🔥 CENTRALIZED UPDATE TRIP STATUS
    FRONTEND SYNCED VERSION (WITH LIVE ETA LISTENERS)
    + NEW: push notifications to rider
@@ -3254,14 +3142,10 @@ app.post(
       };
 
       // NEW: helper to record earnings once per order (guarded by earningsRecorded)
-      // FIX 7: also writes drivers/{driverId}/earnings/{dateKey} atomically.
       const recordEarningsOnce = async (earningsAmount) => {
         try {
           if (!earningsAmount || earningsAmount <= 0) return;
           const driverRef = db.collection("drivers").doc(driverId);
-          const dateKey = lusakaDateKey();
-          const dailyRef = driverRef.collection("earnings").doc(dateKey);
-          const currency = orderData.currency || "ZMW";
           await db.runTransaction(async (t) => {
             const orderSnap = await t.get(orderRef);
             const od = orderSnap.data() || {};
@@ -3280,14 +3164,6 @@ app.post(
                 totalTrips: prevTrips + 1,
                 totalEarnings: prevEarnings + earningsAmount
               }
-            }, { merge: true });
-            // FIX 7: daily earnings doc
-            t.set(dailyRef, {
-              total: admin.firestore.FieldValue.increment(earningsAmount),
-              trips: admin.firestore.FieldValue.increment(1),
-              currency,
-              date: dateKey,
-              updatedAt: now()
             }, { merge: true });
           });
         } catch (e) {
@@ -4109,58 +3985,7 @@ app.post("/ackDriverEarnings", async (req, res) => {
 });
 
 /* =======================================================
-   FIX 2: DEBUG ROUTE
-   GET /debug/driver-eligibility?driverId=&serviceType=&dispatchService=&pickupLat=&pickupLng=
-   Protected by x-debug-key header === env DEBUG_KEY
-======================================================= */
-app.get("/debug/driver-eligibility", async (req, res) => {
-  try {
-    const expected = process.env.DEBUG_KEY || "";
-    const provided = String(req.headers["x-debug-key"] || "");
-    if (!expected || provided !== expected) {
-      return res.status(403).json({ success: false, error: "Forbidden" });
-    }
-
-    const driverId = val(req.query.driverId);
-    const serviceType = val(req.query.serviceType) || val(req.query.dispatchService);
-    const dispatchService = val(req.query.dispatchService) || serviceType;
-    const pickupLat = Number(req.query.pickupLat);
-    const pickupLng = Number(req.query.pickupLng);
-
-    if (!driverId) {
-      return res.status(400).json({ success: false, error: "Missing driverId" });
-    }
-
-    const [driverDoc, onlineSnap, locSnap] = await Promise.all([
-      db.collection("drivers").doc(driverId).get(),
-      rtdb.ref("drivers_online").once("value"),
-      rtdb.ref("driver_locations").once("value"),
-    ]);
-
-    if (!driverDoc.exists) {
-      return res.status(404).json({ success: false, error: "Driver not found" });
-    }
-
-    const online = onlineSnap.val() || {};
-    const locations = locSnap.val() || {};
-
-    const evalRes = evaluateDriver(driverId, driverDoc.data() || {}, online, locations, {
-      dispatchService,
-      pickupLat,
-      pickupLng,
-    });
-
-    return res.json({ success: true, data: evalRes });
-  } catch (error) {
-    console.error("Error in /debug/driver-eligibility:", error);
-    return res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-/* =======================================================
    🔥 FIRESTORE ORDERS LISTENER
-   FIX 4: atomic driverStatus "waiting" -> "searching" claim
-   before dispatchOrder; dispatchOrder no longer writes it.
 ======================================================= */
 db.collection("orders")
   .onSnapshot(
@@ -4225,9 +4050,7 @@ db.collection("orders")
             "waiting"
 
         ) {
-          // FIX 4: atomic claim
-          const won = await claimDispatch(orderId);
-          if (!won) continue;
+
           console.log(
             "Starting store delivery dispatch"
           );
@@ -4258,9 +4081,7 @@ db.collection("orders")
             "waiting"
 
         ) {
-          // FIX 4: atomic claim
-          const won = await claimDispatch(orderId);
-          if (!won) continue;
+
           console.log(
             "Starting direct trip dispatch"
           );
@@ -4313,35 +4134,7 @@ db.collection("orders")
   );
 
 /* =======================================================
-   FIX 4: atomic dispatch claim helper
-   Moves driverStatus "waiting" -> "searching" and sets
-   dispatchStartedAt inside a transaction. Returns true iff
-   this caller won the claim.
-======================================================= */
-async function claimDispatch(orderId) {
-  try {
-    const orderRef = db.collection("orders").doc(orderId);
-    return await db.runTransaction(async (t) => {
-      const snap = await t.get(orderRef);
-      if (!snap.exists) return false;
-      const d = snap.data() || {};
-      if (d.driverStatus !== "waiting") return false;
-      t.update(orderRef, {
-        driverStatus: "searching",
-        dispatchStartedAt: now()
-      });
-      return true;
-    });
-  } catch (e) {
-    console.log("claimDispatch error", e?.message || e);
-    return false;
-  }
-}
-
-/* =======================================================
    🚕 GET RIDE OPTIONS (FIX 4: stops, parallel pricing, polyline)
-   FIX 1: uses evaluateDriver; now also requires verificationStatus === "approved".
-   FIX 2: logs diagnostics when zero usable drivers.
 ======================================================= */
 app.post("/getRideOptions", async (req, res) => { try { const body = req.body || {}; const pickupLat = Number(body.pickupLat); const pickupLng = Number(body.pickupLng); const dropLat = Number(body.dropLat); const dropLng = Number(body.dropLng); const serviceType = (body.serviceType || "ride").toLowerCase(); const totalKg = Math.max(0, Number(body.totalKg) || 0); const isDeliveryFamily = DELIVERY_FAMILY.includes(serviceType);
 
@@ -4377,37 +4170,29 @@ const driversSnap = await db.collection("drivers").get();
 
 const drivers = [];
 let onlineFree = 0;
-const reasonCounts = {};
-const rejected = [];
 
 driversSnap.forEach((doc) => {
   const d = doc.data() || {};
   const uid = d.uid || doc.id;
   if (!uid) return;
+  if (!online[uid]?.isOnline) return;
+  if (online[uid]?.isBusy) return;
+  if (!locations[uid]?.l) return;
+  if (!locationIsFresh(locations[uid])) return;
+  if (!d.vehicle) return;
 
-  // FIX 1: route through evaluateDriver with dispatchService=serviceType.
-  const evalRes = evaluateDriver(uid, d, online, locations, {
-    dispatchService: serviceType,
-    pickupLat,
-    pickupLng,
-    totalKg,
-  });
+  const services = Array.isArray(d.vehicle.services) ? d.vehicle.services : [];
+  const vehicleCategory = Array.isArray(d.vehicle.vehicleCategory) ? d.vehicle.vehicleCategory : [];
+  const pricingCategory = Array.isArray(d.vehicle.pricingCategory) ? d.vehicle.pricingCategory : [];
 
-  if (!evalRes.ok) {
-    reasonCounts[evalRes.reason] = (reasonCounts[evalRes.reason] || 0) + 1;
-    rejected.push({ uid, reason: evalRes.reason, distanceKm: evalRes.distanceKm, locAgeSec: evalRes.locAgeSec });
-    return;
-  }
+  if (!isDeliveryFamily && !services.includes(serviceType)) return;
 
   onlineFree++;
 
   const lat = Number(locations[uid].l[0]);
   const lng = Number(locations[uid].l[1]);
-  const distance = evalRes.distanceKm != null ? evalRes.distanceKm : haversine(pickupLat, pickupLng, lat, lng);
-
-  const services = Array.isArray(d.vehicle.services) ? d.vehicle.services : [];
-  const vehicleCategory = Array.isArray(d.vehicle.vehicleCategory) ? d.vehicle.vehicleCategory : [];
-  const pricingCategory = Array.isArray(d.vehicle.pricingCategory) ? d.vehicle.pricingCategory : [];
+  const distance = haversine(pickupLat, pickupLng, lat, lng);
+  if (distance > DRIVER_SEARCH_RADIUS_KM) return;
 
   drivers.push({
     uid,
@@ -4486,19 +4271,11 @@ if (isDeliveryFamily) {
   cards = cards.sort((a, b) => rank(a) - rank(b) || (a.capacityKg || 0) - (b.capacityKg || 0));
 
   if (!usable.length) {
-    // FIX 2: diagnostics
-    logZeroDriverDiagnostics("getRideOptions", reasonCounts, rejected);
     console.log("getRideOptions: no drivers", {
       pickupLat, pickupLng, totalKg, serviceType,
       onlineFreeDrivers: onlineFree, withinRadius: drivers.length,
       radiusKm: DRIVER_SEARCH_RADIUS_KM
     });
-  }
-} else {
-  // Non-delivery: also log when no card is enabled
-  const anyEnabled = cards.some(c => c.enabled);
-  if (!anyEnabled) {
-    logZeroDriverDiagnostics("getRideOptions", reasonCounts, rejected);
   }
 }
 
@@ -4865,3 +4642,4 @@ app.listen(
     startStoreReminderSweep();
   }
 );
+
