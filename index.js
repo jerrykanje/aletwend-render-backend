@@ -4845,6 +4845,68 @@ app.post("/updateOrderStops", async (req, res) => {
 });
 
 /* =======================================================
+   NEARBY DRIVERS (for the client's background maps)
+   GET /nearbyDrivers?lat=&lng=&radiusKm=
+   Same rules as ride matching: online, not busy, fresh location,
+   approved, has a vehicle. Returns only what the map needs.
+======================================================= */
+app.get("/nearbyDrivers", async (req, res) => {
+  try {
+    const lat = Number(req.query.lat);
+    const lng = Number(req.query.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      return res.status(400).json({ success: false, drivers: [] });
+    }
+    const radiusKm = Math.min(Math.max(Number(req.query.radiusKm) || 5, 0.5), 15);
+
+    const [onlineSnap, locSnap] = await Promise.all([
+      rtdb.ref("drivers_online").once("value"),
+      rtdb.ref("driver_locations").once("value"),
+    ]);
+    const online = onlineSnap.val() || {};
+    const locations = locSnap.val() || {};
+
+    const near = [];
+    for (const uid of Object.keys(online)) {
+      const node = online[uid] || {};
+      if (!node.isOnline || node.isBusy) continue;
+      const loc = locations[uid];
+      if (!loc || !Array.isArray(loc.l) || loc.l.length !== 2) continue;
+      if (!locationIsFresh(loc)) continue;
+      const dLat = Number(loc.l[0]);
+      const dLng = Number(loc.l[1]);
+      const km = haversine(lat, lng, dLat, dLng);
+      if (!(km <= radiusKm)) continue;
+      near.push({ uid, lat: dLat, lng: dLng, km });
+    }
+    near.sort((a, b) => a.km - b.km);
+    const top = near.slice(0, 30);
+
+    const docs = top.length
+      ? await db.getAll(...top.map((n) => db.collection("drivers").doc(n.uid)))
+      : [];
+    const drivers = [];
+    docs.forEach((doc, i) => {
+      const d = doc.exists ? (doc.data() || {}) : {};
+      if (!d.vehicle) return;
+      if (d.verificationStatus && d.verificationStatus !== "approved") return;
+      const cats = Array.isArray(d.vehicle.vehicleCategory) ? d.vehicle.vehicleCategory : [];
+      drivers.push({
+        id: top[i].uid,
+        lat: top[i].lat,
+        lng: top[i].lng,
+        vehicleCategory: cats[0] || "",
+        color: d.vehicle.color || ""
+      });
+    });
+    return res.json({ success: true, drivers });
+  } catch (e) {
+    console.log("nearbyDrivers error", e?.message || e);
+    return res.status(500).json({ success: false, drivers: [] });
+  }
+});
+
+/* =======================================================
    HOME
 ======================================================= */
 app.get(
