@@ -51,7 +51,10 @@ async function sendPushNotification(fcmToken, title, body, data = {}) {
     await admin.messaging().send({
       token: fcmToken,
       notification: { title, body },
-      data
+      data,
+      // High priority + the "new_orders" (IMPORTANCE_HIGH) channel created by the native kit,
+      // so the phone shows a banner at the top of the screen instead of a silent tray icon.
+      android: { priority: "high", notification: { channelId: "new_orders", priority: "high", defaultSound: true } }
     });
     console.log(`Push sent: "${title}"`);
   } catch (e) {
@@ -4156,6 +4159,50 @@ app.get("/debug/driver-eligibility", async (req, res) => {
     return res.status(500).json({ success: false, error: error.message });
   }
 });
+
+/* ---------------- CHAT MESSAGE PUSH (client <-> driver) ----------------
+   Apps write to messages/{orderId}/thread/{id}. When the app is in the background the
+   phone gets a banner at the top (data-only push; the native kit shows it). */
+(function startChatPushListener() {
+  const startedAt = Date.now();
+  let first = true;
+  try {
+    db.collectionGroup("thread").onSnapshot(
+      async (snapshot) => {
+        if (first) { first = false; return; } // ignore the initial dump of old messages
+        for (const change of snapshot.docChanges()) {
+          if (change.type !== "added") continue;
+          try {
+            const m = change.doc.data() || {};
+            const ref = change.doc.ref;
+            const orderId = ref.parent && ref.parent.parent ? ref.parent.parent.id : "";
+            if (!orderId || !m.text) continue;
+            const ts = toMillis(m.timestamp) || Date.now();
+            if (ts < startedAt - 5000 || Date.now() - ts > 2 * 60 * 1000) continue; // old / stale
+            const orderSnap = await db.collection("orders").doc(orderId).get();
+            if (!orderSnap.exists) continue;
+            const o = orderSnap.data() || {};
+            const fromDriver = m.sender === "driver";
+            const targetId = fromDriver ? (o.userId || o.riderId || o.clientId) : o.driverId;
+            const collection = fromDriver ? "users" : "drivers";
+            if (!targetId) continue;
+            await pushData(collection, String(targetId), {
+              type: "chat_message",
+              orderId: String(orderId),
+              title: String(m.senderName || (fromDriver ? "Driver" : "Customer")),
+              body: String(m.text).slice(0, 140)
+            }, { ttlMs: 60000 });
+          } catch (e) {
+            console.log("chat push error", e?.message || e);
+          }
+        }
+      },
+      (e) => console.log("chat push listener error", e?.message || e)
+    );
+  } catch (e) {
+    console.log("chat push listener failed", e?.message || e);
+  }
+})();
 
 /* =======================================================
    🔥 FIRESTORE ORDERS LISTENER
