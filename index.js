@@ -51,7 +51,10 @@ async function sendPushNotification(fcmToken, title, body, data = {}) {
     await admin.messaging().send({
       token: fcmToken,
       notification: { title, body },
-      data
+      data,
+      // High priority + the "new_orders" (IMPORTANCE_HIGH) channel created by the native kit,
+      // so the phone shows a banner at the top of the screen instead of a silent tray icon.
+      android: { priority: "high", notification: { channelId: "new_orders", priority: "high", defaultSound: true } }
     });
     console.log(`Push sent: "${title}"`);
   } catch (e) {
@@ -2567,7 +2570,7 @@ function evaluateDriver(uid, driverDoc, online, locations, ctx) {
   if (!d.vehicle) {
     reasons.push("no_vehicle");
   }
-  if (d.verificationStatus !== "approved") {
+  if (d.verificationStatus !== "approved" && !(d.vehicle && d.vehicle.verificationStatus === "approved")) {
     reasons.push("not_approved");
   }
 
@@ -2904,6 +2907,23 @@ async function sendRequestToDriver(
 async function dispatchOrder(orderId, orderData) {
   try {
     const workflowType = val(orderData.workflowType);
+
+    // Store orders: if the pickup (store) coordinates are missing/zero, take them from the store
+    // document so the routes (driver -> store and store -> customer) can be drawn.
+    if (orderData.storeId && (!Number.isFinite(Number(orderData.pickupLat)) || Number(orderData.pickupLat) === 0 || !Number(orderData.pickupLng))) {
+      try {
+        const st = await db.collection("stores").doc(String(orderData.storeId)).get();
+        const loc = (st.exists && st.data().location) || null;
+        const sLat = Number(loc && (loc.lat ?? loc.latitude));
+        const sLng = Number(loc && (loc.lng ?? loc.longitude));
+        if (Number.isFinite(sLat) && Number.isFinite(sLng) && (sLat !== 0 || sLng !== 0)) {
+          orderData = { ...orderData, pickupLat: sLat, pickupLng: sLng, storeLat: sLat, storeLng: sLng };
+          await db.collection("orders").doc(orderId).update({ pickupLat: sLat, pickupLng: sLng, storeLat: sLat, storeLng: sLng }).catch(() => {});
+        }
+      } catch (e) {
+        console.log("store coordinate lookup failed", e?.message || e);
+      }
+    }
 
     // Extract stops with coordinates (filter out zero-coord stops)
     const stops = (orderData.stops || []).filter(
@@ -4157,6 +4177,53 @@ app.get("/debug/driver-eligibility", async (req, res) => {
   }
 });
 
+/* ---------------- CHAT MESSAGE PUSH (client <-> driver) ----------------
+   Apps write to messages/{orderId}/thread/{id}. When the app is in the background the
+   phone gets a banner at the top (data-only push; the native kit shows it). */
+(function startChatPushListener() {
+  // Off by default: this listener reads every chat message once at start-up (Firestore reads cost
+  // money and a restart re-reads them). Set CHAT_PUSH=1 on Render to turn chat banners on.
+  if (process.env.CHAT_PUSH !== "1") return;
+  const startedAt = Date.now();
+  let first = true;
+  try {
+    db.collectionGroup("thread").onSnapshot(
+      async (snapshot) => {
+        if (first) { first = false; return; } // ignore the initial dump of old messages
+        for (const change of snapshot.docChanges()) {
+          if (change.type !== "added") continue;
+          try {
+            const m = change.doc.data() || {};
+            const ref = change.doc.ref;
+            const orderId = ref.parent && ref.parent.parent ? ref.parent.parent.id : "";
+            if (!orderId || !m.text) continue;
+            const ts = toMillis(m.timestamp) || Date.now();
+            if (ts < startedAt - 5000 || Date.now() - ts > 2 * 60 * 1000) continue; // old / stale
+            const orderSnap = await db.collection("orders").doc(orderId).get();
+            if (!orderSnap.exists) continue;
+            const o = orderSnap.data() || {};
+            const fromDriver = m.sender === "driver";
+            const targetId = fromDriver ? (o.userId || o.riderId || o.clientId) : o.driverId;
+            const collection = fromDriver ? "users" : "drivers";
+            if (!targetId) continue;
+            await pushData(collection, String(targetId), {
+              type: "chat_message",
+              orderId: String(orderId),
+              title: String(m.senderName || (fromDriver ? "Driver" : "Customer")),
+              body: String(m.text).slice(0, 140)
+            }, { ttlMs: 60000 });
+          } catch (e) {
+            console.log("chat push error", e?.message || e);
+          }
+        }
+      },
+      (e) => console.log("chat push listener error", e?.message || e)
+    );
+  } catch (e) {
+    console.log("chat push listener failed", e?.message || e);
+  }
+})();
+
 /* =======================================================
    🔥 FIRESTORE ORDERS LISTENER
    FIX 4: atomic driverStatus "waiting" -> "searching" claim
@@ -4889,7 +4956,7 @@ app.get("/nearbyDrivers", async (req, res) => {
     docs.forEach((doc, i) => {
       const d = doc.exists ? (doc.data() || {}) : {};
       if (!d.vehicle) return;
-      if (d.verificationStatus && d.verificationStatus !== "approved") return;
+      if (d.verificationStatus && d.verificationStatus !== "approved" && !(d.vehicle && d.vehicle.verificationStatus === "approved")) return;
       const cats = Array.isArray(d.vehicle.vehicleCategory) ? d.vehicle.vehicleCategory : [];
       drivers.push({
         id: top[i].uid,
