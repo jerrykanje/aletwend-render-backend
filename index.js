@@ -75,8 +75,13 @@ async function sendPushNotification(fcmToken, title, body, data = {}) {
  * @param {Array} stops - Optional array of {lat, lng} waypoints
  * @returns {Promise<Object>} - Route data with distanceKm, durationMinutes, geometry
  */
+// When ORS says "too many requests" / "quota used up" / "bad key", stop calling it for a while
+// so every request does not wait for a refusal. The OSRM fallback below takes over meanwhile.
+let orsBlockedUntil = 0;
+
 async function getRouteData(startLat, startLng, endLat, endLng, stops = []) {
   try {
+    if (Date.now() < orsBlockedUntil) return null;
     const ORS_API_KEY = process.env.ORS_API_KEY;
     if (!ORS_API_KEY) {
       console.error("ORS_API_KEY not configured");
@@ -127,7 +132,49 @@ async function getRouteData(startLat, startLng, endLat, endLng, stops = []) {
 
     return null;
   } catch (error) {
-    console.error("getRouteData error:", error.response?.status, error.response?.data?.error?.message || error.message);
+    const status = error.response?.status;
+    console.error("getRouteData error:", status, error.response?.data?.error?.message || error.message);
+    if (status === 429) {
+      // free plan: 40 requests/minute and 2000/day. Back off 60s (a daily limit resets at 00:00 UTC).
+      orsBlockedUntil = Date.now() + 60 * 1000;
+      console.error("ORS rate/quota limit hit - routing falls back to OSRM for 60s");
+    } else if (status === 401 || status === 403) {
+      orsBlockedUntil = Date.now() + 5 * 60 * 1000;
+      console.error("ORS key rejected or quota exhausted - check ORS_API_KEY / dashboard");
+    }
+    return null;
+  }
+}
+
+/** Second routing source used only when ORS fails. Public OSRM demo server: free, no key, best-effort. */
+async function getRouteDataOsrm(startLat, startLng, endLat, endLng, stops = []) {
+  try {
+    const validStops = (stops || []).filter(
+      s => s && s.lat && s.lng && Number(s.lat) !== 0 && Number(s.lng) !== 0
+    );
+    const pts = [
+      [startLng, startLat],
+      ...validStops.map(s => [Number(s.lng), Number(s.lat)]),
+      [endLng, endLat]
+    ];
+    const path = pts.map(p => `${p[0]},${p[1]}`).join(";");
+    const r = await axios.get(
+      `https://router.project-osrm.org/route/v1/driving/${path}`,
+      { params: { overview: "full", geometries: "geojson" }, timeout: 8000 }
+    );
+    const route = r.data && r.data.routes && r.data.routes[0];
+    if (!route || !route.geometry || !Array.isArray(route.geometry.coordinates)) return null;
+    const geometry = route.geometry.coordinates;
+    const encoded = polyline.encode(geometry.map(c => [c[1], c[0]]));
+    console.log(`OSRM fallback success: ${Math.round(route.distance / 100) / 10}km`);
+    return {
+      distanceKm: Math.round(route.distance / 100) / 10,
+      durationMinutes: Math.round(route.duration / 60),
+      geometry,
+      encodedPolyline: encoded || null
+    };
+  } catch (error) {
+    console.error("getRouteDataOsrm error:", error.response?.status, error.message);
     return null;
   }
 }
@@ -139,6 +186,9 @@ async function getRouteData(startLat, startLng, endLat, endLng, stops = []) {
 async function getRouteDataWithFallback(startLat, startLng, endLat, endLng, stops = []) {
   const orsData = await getRouteData(startLat, startLng, endLat, endLng, stops);
   if (orsData) return orsData;
+
+  const osrmData = await getRouteDataOsrm(startLat, startLng, endLat, endLng, stops);
+  if (osrmData) return osrmData;
 
   // Fallback to haversine (no polyline available)
   const distanceKm = haversine(startLat, startLng, endLat, endLng);
