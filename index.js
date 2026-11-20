@@ -3493,7 +3493,10 @@ app.post(
               plateNumber:
                 val(
                   vehicle.plateNumber
-                )
+                ),
+
+              vehicleIcon:
+                vehicleIconName(vehicle)
             };
           }
 
@@ -4961,6 +4964,43 @@ app.post("/updateOrderStops", async (req, res) => {
   }
 });
 
+
+/* =======================================================
+   VEHICLE PICTURE NAME (same rule as the client and driver apps)
+   b = black, bl = blue, r = red, g = gray, w = white
+======================================================= */
+function vehicleColorCode(color) {
+  const c = String(color || "").toLowerCase().trim();
+  if (!c) return "b";
+  if (["b", "bl", "r", "g", "w"].includes(c)) return c;
+  if (c.includes("blue") || c.includes("navy")) return "bl";
+  if (c.includes("red") || c.includes("burgundy")) return "r";
+  if (c.includes("white") || c.includes("beige")) return "w";
+  if (c.includes("gray") || c.includes("grey") || c.includes("silver")) return "g";
+  return "b";
+}
+function vehicleIconName(v) {
+  v = v || {};
+  const type = String(v.type || "").toLowerCase().trim();
+  const asList = (x) => (Array.isArray(x) ? x : typeof x === "string" && x ? [x] : []).map((t) => String(t).toLowerCase().trim());
+  const cats = [...asList(v.pricingCategory), ...asList(v.vehicleCategory)];
+  const has = (t) => cats.some((c) => c.includes(t));
+  let base = "car";
+  if (type === "bicycle" || type === "cyclist" || has("bicycle")) base = "bicycle";
+  else if (type === "motorbike" || type === "motorcycle" || has("motorbike")) base = "motorbike";
+  else if (type === "minibus" || type === "bus" || has("xxl") || cats.includes("bus")) base = "bus";
+  else if (type === "truck" || has("truck")) {
+    const refrigerated = String(v.refrigerationType || "").toLowerCase() === "refrigerated" || has("refrigerated");
+    const open = String(v.cargoType || "").toLowerCase() === "open" || has("open_truck");
+    base = refrigerated ? "truck" : open ? "open" : "closed";
+  } else if (has("aletwende")) return "aletwende1";
+  else if (String(v.brand || "").toLowerCase() === "women") return "acarg";
+  const variants = { bicycle: ["b", "bl", "r"], motorbike: ["b", "bl", "r"], bus: ["b", "bl", "g", "w"] };
+  const allowed = variants[base] || ["b", "bl", "g", "r", "w"];
+  const col = vehicleColorCode(v.color);
+  return "a" + base + (allowed.includes(col) ? col : "b");
+}
+
 /* =======================================================
    NEARBY DRIVERS (for the client's background maps)
    GET /nearbyDrivers?lat=&lng=&radiusKm=
@@ -5013,7 +5053,8 @@ app.get("/nearbyDrivers", async (req, res) => {
         lat: top[i].lat,
         lng: top[i].lng,
         vehicleCategory: cats[0] || "",
-        color: d.vehicle.color || ""
+        color: d.vehicle.color || "",
+        icon: vehicleIconName(d.vehicle)
       });
     });
     return res.json({ success: true, drivers });
