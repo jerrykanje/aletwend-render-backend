@@ -3493,10 +3493,7 @@ app.post(
               plateNumber:
                 val(
                   vehicle.plateNumber
-                ),
-
-              vehicleIcon:
-                vehicleIconName(vehicle)
+                )
             };
           }
 
@@ -4534,12 +4531,9 @@ driversSnap.forEach((doc) => {
   const lng = Number(locations[uid].l[1]);
   const distance = evalRes.distanceKm != null ? evalRes.distanceKm : haversine(pickupLat, pickupLng, lat, lng);
 
-  const asArr = (x) => (Array.isArray(x) ? x : (typeof x === "string" && x ? [x] : []));
-  const services = asArr(d.vehicle.services);
-  const vehicleCategory = asArr(d.vehicle.vehicleCategory);
-  const pricingCategory = asArr(d.vehicle.pricingCategory);
-  // bicycle accounts store vehicleCategory as the plain string "bicycle"
-  if (vehicleCategory.includes("bicycle") && !vehicleCategory.includes("delivery_bicycle")) vehicleCategory.push("delivery_bicycle");
+  const services = Array.isArray(d.vehicle.services) ? d.vehicle.services : [];
+  const vehicleCategory = Array.isArray(d.vehicle.vehicleCategory) ? d.vehicle.vehicleCategory : [];
+  const pricingCategory = Array.isArray(d.vehicle.pricingCategory) ? d.vehicle.pricingCategory : [];
 
   drivers.push({
     uid,
@@ -4593,11 +4587,7 @@ let cards = categoryMatches.map(({ category, capacityKg, tooHeavy, match, pricin
   }
   const pricingDoc = pricingResults[i];
   const baseFare = pricingDoc?.exists ? (pricingDoc.data().baseFare || 40) : 40;
-  // Arrival time of the CLOSEST matching vehicle: straight-line distance x 1.35 (roads bend)
-  // divided by a realistic city speed for that kind of vehicle. No fixed 2-minute minimum any more.
-  const vType = String((match.vehicle && match.vehicle.type) || "").toLowerCase();
-  const cityKmh = vType === "bicycle" ? 12 : vType === "motorbike" ? 32 : (vType === "truck" || vType === "minibus") ? 24 : 28;
-  const driverEtaMinutes = Math.max(1, Math.ceil(((match.distance * 1.35) / cityKmh) * 60));
+  const driverEtaMinutes = Math.max(2, Math.round(match.distance * 2));
   const price = calculateFare(baseFare, tripKm);
   return {
     category, title: DISPLAY_NAMES[category] || category,
@@ -4668,13 +4658,22 @@ app.post("/reroutePolyline", async (req, res) => {
     const orderData = orderDoc.data() || {};
     const workflowType = val(orderData.workflowType);
 
+    // Only the driver who owns this order may reroute it, and not more often than every 8 seconds
+    // (protects the routing quota when a GPS fix is wrong or the app asks twice).
+    if (orderData.driverId && orderData.driverId !== driverId) {
+      return res.status(403).json({ success: false, error: "Not your order" });
+    }
+    if (Date.now() - (Number(orderData.lastRerouteAt) || 0) < 8000) {
+      return res.json({ success: true, skipped: true });
+    }
+
     // Determine destination based on phase + workflow
     let destLat, destLng;
     let stops = [];
 
     if (phase === 'accepted') {
       // Driver is heading to pickup (direct_trip) or store (store_delivery)
-      if (workflowType === 'store_delivery') {
+      if (workflowType === 'store_delivery' || workflowType === 'delivery') {
         destLat = Number(orderData.storeLat || orderData.pickupLat);
         destLng = Number(orderData.storeLng || orderData.pickupLng);
       } else {
@@ -4708,11 +4707,13 @@ app.post("/reroutePolyline", async (req, res) => {
     // Update Firestore (client app listens here)
     const firestoreUpdate = isPickupLeg
       ? {
+          lastRerouteAt: Date.now(),
           driverToPickupPolyline: routeData.encodedPolyline,
           driverToPickupDistanceKm: routeData.distanceKm,
           driverToPickupEtaMinutes: routeData.durationMinutes,
         }
       : {
+          lastRerouteAt: Date.now(),
           polyline: routeData.encodedPolyline,
           encodedPolyline: routeData.encodedPolyline,
           distanceKm: routeData.distanceKm,
@@ -4971,155 +4972,12 @@ app.post("/updateOrderStops", async (req, res) => {
   }
 });
 
-
-/* =======================================================
-   VEHICLE PICTURE NAME (same rule as the client and driver apps)
-   b = black, bl = blue, r = red, g = gray, w = white
-======================================================= */
-function vehicleColorCode(color) {
-  const c = String(color || "").toLowerCase().trim();
-  if (!c) return "b";
-  if (["b", "bl", "r", "g", "w"].includes(c)) return c;
-  if (c.includes("blue") || c.includes("navy")) return "bl";
-  if (c.includes("red") || c.includes("burgundy")) return "r";
-  if (c.includes("white") || c.includes("beige")) return "w";
-  if (c.includes("gray") || c.includes("grey") || c.includes("silver")) return "g";
-  return "b";
-}
-function vehicleIconName(v) {
-  v = v || {};
-  const type = String(v.type || "").toLowerCase().trim();
-  const asList = (x) => (Array.isArray(x) ? x : typeof x === "string" && x ? [x] : []).map((t) => String(t).toLowerCase().trim());
-  const cats = [...asList(v.pricingCategory), ...asList(v.vehicleCategory)];
-  const has = (t) => cats.some((c) => c.includes(t));
-  let base = "car";
-  if (type === "bicycle" || type === "cyclist" || has("bicycle")) base = "bicycle";
-  else if (type === "motorbike" || type === "motorcycle" || has("motorbike")) base = "motorbike";
-  else if (type === "minibus" || type === "bus" || has("xxl") || cats.includes("bus")) base = "bus";
-  else if (type === "truck" || has("truck")) {
-    const refrigerated = String(v.refrigerationType || "").toLowerCase() === "refrigerated" || has("refrigerated");
-    const open = String(v.cargoType || "").toLowerCase() === "open" || has("open_truck");
-    base = refrigerated ? "truck" : open ? "open" : "closed";
-  } else if (has("aletwende")) return "aletwende1";
-  else if (String(v.brand || "").toLowerCase() === "women") return "acarg";
-  const variants = { bicycle: ["b", "bl", "r"], motorbike: ["b", "bl", "r"], bus: ["b", "bl", "g", "w"] };
-  const allowed = variants[base] || ["b", "bl", "g", "r", "w"];
-  const col = vehicleColorCode(v.color);
-  return "a" + base + (allowed.includes(col) ? col : "b");
-}
-
 /* =======================================================
    NEARBY DRIVERS (for the client's background maps)
    GET /nearbyDrivers?lat=&lng=&radiusKm=
    Same rules as ride matching: online, not busy, fresh location,
    approved, has a vehicle. Returns only what the map needs.
 ======================================================= */
-
-/* =======================================================
-   DEMAND ZONES (drivers see which areas are busy)
-   Share of the requests made in the last N minutes, grouped by area.
-   Centres are approximate - you can replace them any time by creating a Firestore
-   collection "demandZones" with docs { name, lat, lng, radiusM }.
-======================================================= */
-const DEFAULT_DEMAND_ZONES = [
-  { name: "Lusaka CBD", lat: -15.4167, lng: 28.2833, radiusM: 1500 },
-  { name: "Kamwala", lat: -15.4350, lng: 28.2900, radiusM: 1500 },
-  { name: "Northmead", lat: -15.3984, lng: 28.3069, radiusM: 1500 },
-  { name: "Rhodes Park", lat: -15.4040, lng: 28.3000, radiusM: 1200 },
-  { name: "Olympia", lat: -15.4100, lng: 28.3100, radiusM: 1400 },
-  { name: "Roma", lat: -15.3870, lng: 28.3250, radiusM: 1800 },
-  { name: "Kabulonga", lat: -15.4000, lng: 28.3350, radiusM: 2000 },
-  { name: "Kalingalinga", lat: -15.3930, lng: 28.3330, radiusM: 1500 },
-  { name: "Woodlands", lat: -15.4300, lng: 28.3130, radiusM: 1800 },
-  { name: "Libala", lat: -15.4470, lng: 28.3250, radiusM: 2000 },
-  { name: "Chilenje", lat: -15.4520, lng: 28.3010, radiusM: 1800 },
-  { name: "Chawama", lat: -15.4650, lng: 28.2880, radiusM: 1800 },
-  { name: "Kanyama", lat: -15.4500, lng: 28.2450, radiusM: 2200 },
-  { name: "Makeni", lat: -15.4670, lng: 28.2630, radiusM: 2200 },
-  { name: "Lusaka West", lat: -15.4200, lng: 28.2000, radiusM: 3500 },
-  { name: "Matero", lat: -15.3800, lng: 28.2500, radiusM: 2500 },
-  { name: "Emmasdale", lat: -15.3750, lng: 28.2900, radiusM: 1800 },
-  { name: "Garden", lat: -15.3700, lng: 28.3200, radiusM: 1800 },
-  { name: "Chaisa", lat: -15.3500, lng: 28.3000, radiusM: 2500 },
-  { name: "Mtendere", lat: -15.4320, lng: 28.3550, radiusM: 2000 },
-  { name: "Ibex Hill", lat: -15.4400, lng: 28.3500, radiusM: 2200 },
-  { name: "Chelstone", lat: -15.3880, lng: 28.3800, radiusM: 2500 },
-  { name: "Chamba Valley", lat: -15.3850, lng: 28.3950, radiusM: 2500 }
-];
-let demandZonesCache = { at: 0, zones: null };
-async function loadDemandZones() {
-  if (demandZonesCache.zones && Date.now() - demandZonesCache.at < 10 * 60 * 1000) return demandZonesCache.zones;
-  let zones = DEFAULT_DEMAND_ZONES;
-  try {
-    const snap = await db.collection("demandZones").get();
-    const custom = [];
-    snap.forEach((d) => {
-      const z = d.data() || {};
-      if (z.name && Number.isFinite(Number(z.lat)) && Number.isFinite(Number(z.lng))) {
-        custom.push({ name: String(z.name), lat: Number(z.lat), lng: Number(z.lng), radiusM: Number(z.radiusM) || 2000 });
-      }
-    });
-    if (custom.length) zones = custom;
-  } catch (e) { /* use defaults */ }
-  demandZonesCache = { at: Date.now(), zones };
-  return zones;
-}
-const demandResultCache = {};
-app.get("/demandZones", async (req, res) => {
-  try {
-    const type = ["ride", "delivery", "all"].includes(String(req.query.type)) ? String(req.query.type) : "all";
-    const windowMin = Math.min(120, Math.max(10, Number(req.query.windowMin) || 30));
-    const key = type + ":" + windowMin;
-    const hit = demandResultCache[key];
-    if (hit && Date.now() - hit.at < 20000) return res.json(hit.body);
-
-    const zones = await loadDemandZones();
-    const cutoff = admin.firestore.Timestamp.fromMillis(Date.now() - windowMin * 60 * 1000);
-    const snap = await db.collection("orders").where("createdAt", ">=", cutoff).get();
-
-    const counts = zones.map(() => 0);
-    let total = 0;
-    snap.forEach((doc) => {
-      const o = doc.data() || {};
-      const isRide = String(o.workflowType || "") === "direct_trip";
-      if (type === "ride" && !isRide) return;
-      if (type === "delivery" && isRide) return;
-      const lat = Number(o.pickupLat != null ? o.pickupLat : o.pickup && o.pickup.lat);
-      const lng = Number(o.pickupLng != null ? o.pickupLng : o.pickup && o.pickup.lng);
-      if (!Number.isFinite(lat) || !Number.isFinite(lng) || (lat === 0 && lng === 0)) return;
-      let best = -1, bestD = Infinity;
-      zones.forEach((z, i) => {
-        const d = haversine(lat, lng, z.lat, z.lng) * 1000;
-        if (d <= z.radiusM * 1.6 && d < bestD) { bestD = d; best = i; }
-      });
-      if (best >= 0) { counts[best]++; total++; }
-    });
-
-    const max = Math.max(0, ...counts);
-    const out = zones
-      .map((z, i) => ({ id: "z" + i, name: z.name, lat: z.lat, lng: z.lng, radiusM: z.radiusM, requests: counts[i] }))
-      .filter((z) => z.requests > 0)
-      .map((z) => {
-        const ratio = max ? z.requests / max : 0;
-        const level = ratio >= 0.66 ? "high" : ratio >= 0.33 ? "medium" : "low";
-        return {
-          ...z,
-          percent: Math.round((z.requests / total) * 1000) / 10,
-          level,
-          color: level === "high" ? "#E53935" : level === "medium" ? "#FBC02D" : "#43A047"
-        };
-      })
-      .sort((a, b) => b.requests - a.requests);
-
-    const body = { ok: true, type, windowMin, totalRequests: total, updatedAt: Date.now(), zones: out };
-    demandResultCache[key] = { at: Date.now(), body };
-    res.json(body);
-  } catch (e) {
-    console.error("demandZones error:", e.message);
-    res.status(500).json({ ok: false, zones: [] });
-  }
-});
-
 app.get("/nearbyDrivers", async (req, res) => {
   try {
     const lat = Number(req.query.lat);
@@ -5166,9 +5024,7 @@ app.get("/nearbyDrivers", async (req, res) => {
         lat: top[i].lat,
         lng: top[i].lng,
         vehicleCategory: cats[0] || "",
-        color: d.vehicle.color || "",
-        icon: vehicleIconName(d.vehicle),
-        services: Array.isArray(d.vehicle.services) ? d.vehicle.services : []
+        color: d.vehicle.color || ""
       });
     });
     return res.json({ success: true, drivers });
