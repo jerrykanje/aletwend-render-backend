@@ -4671,25 +4671,40 @@ app.post("/reroutePolyline", async (req, res) => {
     let destLat, destLng;
     let stops = [];
 
+    // first usable number (orders store coordinates in more than one shape)
+    const firstNum = (...vals) => {
+      for (const v of vals) {
+        const n = Number(v);
+        if (v !== null && v !== undefined && v !== "" && Number.isFinite(n) && n !== 0) return n;
+      }
+      return NaN;
+    };
+    const hintLat = Number(body.destLat);
+    const hintLng = Number(body.destLng);
     if (phase === 'accepted') {
       // Driver is heading to pickup (direct_trip) or store (store_delivery)
       if (workflowType === 'store_delivery' || workflowType === 'delivery') {
-        destLat = Number(orderData.storeLat || orderData.pickupLat);
-        destLng = Number(orderData.storeLng || orderData.pickupLng);
+        destLat = firstNum(orderData.storeLat, orderData.pickupLat, orderData.storeLocation && orderData.storeLocation.lat, orderData.storeLocation && orderData.storeLocation.latitude, orderData.pickupLocation && orderData.pickupLocation.latitude, hintLat);
+        destLng = firstNum(orderData.storeLng, orderData.pickupLng, orderData.storeLocation && orderData.storeLocation.lng, orderData.storeLocation && orderData.storeLocation.longitude, orderData.pickupLocation && orderData.pickupLocation.longitude, hintLng);
       } else {
-        destLat = Number(orderData.pickupLat);
-        destLng = Number(orderData.pickupLng);
+        destLat = firstNum(orderData.pickupLat, orderData.pickupLocation && orderData.pickupLocation.latitude, orderData.pickupLocation && orderData.pickupLocation.lat, hintLat);
+        destLng = firstNum(orderData.pickupLng, orderData.pickupLocation && orderData.pickupLocation.longitude, orderData.pickupLocation && orderData.pickupLocation.lng, hintLng);
       }
       // No stops on the driver-to-pickup leg
     } else if (phase === 'started' || phase === 'picked_up') {
       // Driver is heading to dropoff
-      destLat = Number(orderData.dropLat);
-      destLng = Number(orderData.dropLng);
+      destLat = firstNum(orderData.dropLat, orderData.destinationLocation && orderData.destinationLocation.latitude, orderData.destinationLocation && orderData.destinationLocation.lat, hintLat);
+      destLng = firstNum(orderData.dropLng, orderData.destinationLocation && orderData.destinationLocation.longitude, orderData.destinationLocation && orderData.destinationLocation.lng, hintLng);
       stops = (orderData.stops || []).filter(
         s => s && Number(s.lat) !== 0 && Number(s.lng) !== 0
       );
     } else {
       return res.status(400).json({ success: false, error: "Invalid phase" });
+    }
+
+    if (!Number.isFinite(destLat) || !Number.isFinite(destLng)) {
+      console.error(`reroutePolyline: no destination coordinates for order ${orderId} phase=${phase}`);
+      return res.status(422).json({ success: false, error: "No destination coordinates" });
     }
 
     // Get fresh route from current driver position → destination (with stops if applicable)
