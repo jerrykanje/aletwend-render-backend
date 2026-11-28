@@ -5286,25 +5286,6 @@ app.post("/admin/broadcast", requireAdmin, async (req, res) => {
     res.json({ ok: true, count: n, batchId });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
-// >>>>>> TEMPORARY BOOTSTRAP START (delete from here ...)
-// TEMPORARY – paste above app.listen(), deploy, call ONCE, then DELETE it and redeploy.
-// On Render add env var ADMIN_BOOTSTRAP_SECRET = any long random text you invent.
-app.post("/bootstrap-admin", async (req, res) => {
-  try {
-    const { secret, email } = req.body || {};
-    if (!process.env.ADMIN_BOOTSTRAP_SECRET || secret !== process.env.ADMIN_BOOTSTRAP_SECRET) {
-      return res.status(403).json({ error: "no" });
-    }
-    const u = await admin.auth().getUserByEmail(String(email));
-    await admin.auth().setCustomUserClaims(u.uid, { admin: true });
-    res.json({ ok: true, uid: u.uid });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-// <<<<<< TEMPORARY BOOTSTRAP END (... to here)
-
 app.listen(
   PORT,
   () => {
