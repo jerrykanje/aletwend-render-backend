@@ -1241,7 +1241,8 @@ async function sweepStaleDriverPresence() {
 async function recordDriverOutcome(driverId, outcome) {
   try {
     if (!driverId || !outcome) return;
-    if (!["accepted", "declined", "expired"].includes(outcome)) return;
+    // "cancelled_driver" = client cancelled with a driver-related reason (counts against the score)
+    if (!["accepted", "declined", "expired", "cancelled_driver"].includes(outcome)) return;
     const ref = db.collection("drivers").doc(driverId);
     await db.runTransaction(async (t) => {
       const snap = await t.get(ref);
@@ -1257,6 +1258,13 @@ async function recordDriverOutcome(driverId, outcome) {
         activityScore,
         activityUpdatedAt: Date.now()
       }, { merge: true });
+      return { activityScore, count: next.length };
+    }).then((r) => {
+      // tell the platform site when a driver keeps turning requests down
+      if (r && r.activityScore !== null && r.count >= 10 && r.activityScore < 50) {
+        createFlag({ app: "driver", uid: driverId, kind: "rejects_many_requests", severity: r.activityScore < 30 ? "high" : "warn",
+          summary: `Activity score ${r.activityScore}% over the last ${r.count} requests` });
+      }
     });
   } catch (e) {
     console.log("recordDriverOutcome error", e?.message || e);
@@ -4750,7 +4758,11 @@ app.post("/reroutePolyline", async (req, res) => {
           tripEtaMinutes: routeData.durationMinutes,
         };
 
-    await rtdb.ref(`driver_trip_requests/${driverId}/${orderId}`).update(rtdbUpdate);
+    // Only update a request node that still exists. If it was already removed after accept, update() would
+    // re-create it holding just the polyline, and the driver app would show it as a new request pop-up.
+    const reqRef = rtdb.ref(`driver_trip_requests/${driverId}/${orderId}`);
+    const reqSnap = await reqRef.once("value");
+    if (reqSnap.exists()) await reqRef.update(rtdbUpdate);
 
     console.log(`Rerouted order ${orderId} for driver ${driverId}, phase=${phase}, new polyline length=${routeData.encodedPolyline.length}`);
 
@@ -5067,6 +5079,231 @@ app.get(
 ======================================================= */
 const PORT =
   process.env.PORT || 3000;
+
+// ===== PASTE into index.js ABOVE `app.listen(` =====
+// Admin-only: signs a Cloudinary upload. Needs env vars on Render:
+//   CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET
+// The Platform site must be signed in as a user whose Firebase custom claim `admin` is true.
+
+async function requireAdmin(req, res, next) {
+  try {
+    const m = /^Bearer (.+)$/.exec(req.headers.authorization || "");
+    if (!m) return res.status(401).json({ error: "Missing token" });
+    const decoded = await admin.auth().verifyIdToken(m[1]);
+    if (decoded.admin !== true) return res.status(403).json({ error: "Not an admin" });
+    req.adminUid = decoded.uid;
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: "Invalid token" });
+  }
+}
+
+app.post("/admin/upload-signature", requireAdmin, (req, res) => {
+  const { CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET } = process.env;
+  if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
+    return res.status(500).json({ error: "Cloudinary is not configured on the server" });
+  }
+  const kind = req.body && req.body.kind === "video" ? "video" : "image";
+  const timestamp = Math.floor(Date.now() / 1000);
+  const params = { folder: "aletwende/content", timestamp };
+  // Videos are cut to 5 seconds on Cloudinary's side, whatever the admin uploads.
+  if (kind === "video") params.transformation = "eo_5";
+  const toSign = Object.keys(params)
+    .sort()
+    .map((k) => `${k}=${params[k]}`)
+    .join("&");
+  const signature = crypto.createHash("sha1").update(toSign + CLOUDINARY_API_SECRET).digest("hex");
+  res.json({
+    cloudName: CLOUDINARY_CLOUD_NAME,
+    apiKey: CLOUDINARY_API_KEY,
+    resourceType: kind,
+    params,
+    signature,
+  });
+});
+
+// ===== Platform site endpoints (needs requireAdmin from admin-upload-snippet.js, pasted above this) =====
+
+const FieldValue = admin.firestore.FieldValue;
+
+// ---- who is this person, for "Hi <name>," ----
+function displayNameFor(app, d) {
+  d = d || {};
+  if (app === "store") return d.storeName || [d.firstName, d.surname].filter(Boolean).join(" ") || "there";
+  if (app === "driver") return (d.profile && d.profile.firstName) || d.firstName || "there";
+  return String(d.name || d.firstName || "there").split(" ")[0];
+}
+const APP_COLLECTION = { client: "users", driver: "drivers", store: "stores" };
+
+async function createNotification({ app, uid, title, body, kind, replyAllowed, batchId, audience, extra }) {
+  const ref = db.collection("notifications").doc();
+  await ref.set({
+    app, uid, title, body,
+    kind: kind || "direct",
+    replyAllowed: !!replyAllowed,
+    read: false,
+    audience: audience || null,
+    batchId: batchId || null,
+    from: "aletwende",
+    createdAt: FieldValue.serverTimestamp(),
+    ...(extra || {}),
+  });
+  // push (best effort)
+  const col = APP_COLLECTION[app];
+  try { await pushData(col, uid, { type: "aletwende_message", title, body: String(body).slice(0, 140), notificationId: ref.id }, { ttlMs: 24 * 3600 * 1000 }); } catch (e) {}
+  return ref.id;
+}
+
+// ---- flags the backend raises for the platform site ----
+async function createFlag({ app, uid, kind, severity, summary }) {
+  try {
+    const col = APP_COLLECTION[app];
+    // one open flag per person+kind per 7 days
+    const since = Date.now() - 7 * 24 * 3600 * 1000;
+    const dup = await db.collection("platformFlags").where("uid", "==", uid).where("kind", "==", kind).where("status", "==", "open").get();
+    if (dup.docs.some((x) => (x.data().createdAtMs || 0) > since)) return;
+    const snap = await db.collection(col).doc(uid).get();
+    const d = snap.exists ? snap.data() : {};
+    const snapshot = app === "driver" ? {
+      name: [d.profile && d.profile.firstName, d.profile && d.profile.lastName].filter(Boolean).join(" "),
+      phone: d.phone || "", email: d.email || "",
+      vehicle: { type: d.vehicle && d.vehicle.type, brand: d.vehicle && d.vehicle.brand, model: d.vehicle && d.vehicle.model, color: d.vehicle && d.vehicle.color, plateNumber: d.vehicle && d.vehicle.plateNumber },
+      rating: d.rating ?? null, activityScore: d.activityScore ?? null, place: d.place || "",
+    } : app === "store" ? {
+      storeName: d.storeName || "", owner: [d.firstName, d.surname].filter(Boolean).join(" "),
+      phone: d.phone || "", email: d.email || "", category: d.category || "", address: d.address || "", rating: d.rating ?? null,
+    } : { name: d.name || "", phone: d.phone || "", email: d.email || "" };
+    await db.collection("platformFlags").add({
+      app, uid, kind, severity: severity || "warn", summary, snapshot,
+      status: "open", createdAt: FieldValue.serverTimestamp(), createdAtMs: Date.now(),
+    });
+  } catch (e) { console.log("createFlag error", e && e.message); }
+}
+
+// ---- approve / reject a driver or store ----
+app.post("/admin/review", requireAdmin, async (req, res) => {
+  try {
+    const { kind, uid, decision, reason } = req.body || {};
+    if (!["driver", "store"].includes(kind) || !uid || !["approved", "rejected"].includes(decision)) {
+      return res.status(400).json({ error: "bad request" });
+    }
+    if (decision === "rejected" && !String(reason || "").trim()) return res.status(400).json({ error: "A reason is required" });
+    const col = kind === "driver" ? "drivers" : "stores";
+    const ref = db.collection(col).doc(String(uid));
+    const snap = await ref.get();
+    if (!snap.exists) return res.status(404).json({ error: "not found" });
+    const patch = {
+      verificationStatus: decision,
+      reviewedAt: FieldValue.serverTimestamp(),
+      reviewedBy: req.adminUid,
+      updatedAt: FieldValue.serverTimestamp(),
+    };
+    if (decision === "rejected") { patch.rejectionReason = String(reason).trim(); }
+    else { patch.rejectionReason = FieldValue.delete(); patch.approvedAt = FieldValue.serverTimestamp(); }
+    if (kind === "driver") patch["vehicle.verificationStatus"] = decision; // old docs keep a second copy
+    await ref.update(patch);
+    const name = displayNameFor(kind, snap.data());
+    await createNotification({
+      app: kind, uid: String(uid), kind: "system",
+      title: decision === "approved" ? (kind === "store" ? "Your store has been approved 🥳" : "You're approved 🥳") : "Application not approved",
+      body: decision === "approved" ? `Hi ${name}, welcome to Aletwende. You can start now.` : `Hi ${name}, ${String(reason).trim()}`,
+    });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ---- message one person (name is added automatically) ----
+app.post("/admin/message", requireAdmin, async (req, res) => {
+  try {
+    const { app: target, uid, title, body, replyAllowed } = req.body || {};
+    if (!APP_COLLECTION[target] || !uid || !String(title || "").trim() || !String(body || "").trim()) return res.status(400).json({ error: "bad request" });
+    const snap = await db.collection(APP_COLLECTION[target]).doc(String(uid)).get();
+    if (!snap.exists) return res.status(404).json({ error: "not found" });
+    const name = displayNameFor(target, snap.data());
+    const id = await createNotification({
+      app: target, uid: String(uid), kind: "direct", replyAllowed: !!replyAllowed,
+      title: String(title).trim(), body: `Hi ${name},\n\n${String(body).trim()}`,
+    });
+    res.json({ ok: true, id });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ---- audiences ----
+function lc(v) { return String(v || "").toLowerCase(); }
+const DRIVER_FILTERS = {
+  drivers_all: () => true,
+  drivers_bicycle: (d) => lc(d.vehicle && d.vehicle.type).includes("bicycle") || lc(d.vehicleCategory) === "bicycle",
+  drivers_motorbike: (d) => lc(d.vehicle && d.vehicle.type).includes("motor") || lc(d.vehicleCategory) === "motorbike",
+  drivers_bus: (d) => ["bus", "minibus"].some((k) => lc(d.vehicle && d.vehicle.type).includes(k) || lc(d.vehicleCategory) === k),
+  drivers_car: (d) => lc(d.vehicle && d.vehicle.type) === "car",
+  drivers_tuktuk: (d) => lc(d.vehicle && d.vehicle.type).includes("tuk"),
+  drivers_refrigerated: (d) => !!(d.vehicle && d.vehicle.refrigerationType) || lc(d.vehicle && d.vehicle.type).includes("refrig"),
+  drivers_open_truck: (d) => lc(d.vehicle && d.vehicle.type).includes("truck") && lc(d.vehicle && d.vehicle.cargoType).includes("open"),
+  drivers_closed_truck: (d) => lc(d.vehicle && d.vehicle.type).includes("truck") && lc(d.vehicle && d.vehicle.cargoType).includes("closed"),
+  // Needs a "women driver" choice at registration: profile.gender === "female" or womenDriver === true
+  drivers_women: (d) => d.womenDriver === true || lc(d.profile && d.profile.gender) === "female",
+};
+[20, 40, 50, 60, 80, 90].forEach((n) => {
+  DRIVER_FILTERS[`drivers_score_below_${n}`] = (d) => typeof d.activityScore === "number" && d.activityScore < n;
+});
+const STORE_CATEGORY = { stores_food: "food", stores_clothes: "clothes", stores_hardware: "hardware", stores_market: "market", stores_small_shop: "small_shop" };
+
+async function audienceRecipients(audience) {
+  if (audience === "clients_all") {
+    const s = await db.collection("users").get();
+    return s.docs.map((x) => ({ app: "client", uid: x.id, data: x.data() }));
+  }
+  if (DRIVER_FILTERS[audience]) {
+    const s = await db.collection("drivers").get();
+    return s.docs
+      .filter((x) => { const d = x.data(); return (d.verificationStatus === "approved" || (d.vehicle && d.vehicle.verificationStatus === "approved")) && DRIVER_FILTERS[audience](d); })
+      .map((x) => ({ app: "driver", uid: x.id, data: x.data() }));
+  }
+  if (audience === "stores_all" || STORE_CATEGORY[audience]) {
+    const s = await db.collection("stores").get();
+    return s.docs
+      .filter((x) => { const d = x.data(); return d.verificationStatus !== "pending" && d.verificationStatus !== "rejected" && (audience === "stores_all" || lc(d.category) === STORE_CATEGORY[audience]); })
+      .map((x) => ({ app: "store", uid: x.id, data: x.data() }));
+  }
+  return null;
+}
+
+app.post("/admin/broadcast", requireAdmin, async (req, res) => {
+  try {
+    const { audience, title, body, dryRun } = req.body || {};
+    const list = await audienceRecipients(String(audience));
+    if (!list) return res.status(400).json({ error: "unknown audience" });
+    if (dryRun) return res.json({ ok: true, count: list.length });
+    if (!String(title || "").trim() || !String(body || "").trim()) return res.status(400).json({ error: "title and body required" });
+    const batchId = `b_${Date.now()}`;
+    let n = 0;
+    for (let i = 0; i < list.length; i += 20) {
+      await Promise.all(list.slice(i, i + 20).map((r) => createNotification({
+        app: r.app, uid: r.uid, kind: "broadcast", audience, batchId,
+        title: String(title).trim(), body: String(body).trim(),
+      }).then(() => { n++; }).catch(() => {})));
+    }
+    res.json({ ok: true, count: n, batchId });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// >>>>>> TEMPORARY BOOTSTRAP START (delete from here ...)
+// TEMPORARY – paste above app.listen(), deploy, call ONCE, then DELETE it and redeploy.
+// On Render add env var ADMIN_BOOTSTRAP_SECRET = any long random text you invent.
+app.post("/bootstrap-admin", async (req, res) => {
+  try {
+    const { secret, email } = req.body || {};
+    if (!process.env.ADMIN_BOOTSTRAP_SECRET || secret !== process.env.ADMIN_BOOTSTRAP_SECRET) {
+      return res.status(403).json({ error: "no" });
+    }
+    const u = await admin.auth().getUserByEmail(String(email));
+    await admin.auth().setCustomUserClaims(u.uid, { admin: true });
+    res.json({ ok: true, uid: u.uid });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+// <<<<<< TEMPORARY BOOTSTRAP END (... to here)
 
 app.listen(
   PORT,
